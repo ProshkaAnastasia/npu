@@ -6,344 +6,355 @@ module sigmoid #(
     input logic clk_i,
     input logic rst_n_i,
 
-    input rs_types_pkg::rs_to_seq_t reduce_to_sigmoid_data_i,
-    input  logic reduce_to_sigmoid_valid_i,
-    output logic reduce_to_sigmoid_ready_o,
+    input logic [31:0] input_data_i,
+    input rs_types_pkg::rs_status_t input_status_i,
+    input  logic input_valid_i,
+    output logic input_ready_o,
 
-    output rs_types_pkg::rs_to_seq_t sigmoid_to_rs_data_o,
-    output logic sigmoid_to_rs_valid_o,
-    input  logic sigmoid_to_rs_ready_i
+    output logic [31:0] result_data_o,
+    output rs_types_pkg::rs_status_t result_status_o,
+    output logic result_valid_o,
+    input  logic result_ready_i
 );
 
     import rs_types_pkg::*;
 
     typedef enum logic [3:0] {
-        IDLE,
-        DECODE,
-        ROM_READ,
-        ROM_READY,
-        DIFF_REQ,
-        DIFF_WAIT,
-        MUL_REQ,
-        MUL_WAIT,
-        FINAL_REQ,
-        FINAL_WAIT,
-        RESULT
+        WAIT_INPUT,
+        PREPARE_LOOKUP,
+        READ_TABLE,
+        WAIT_TABLE_DATA,
+        ISSUE_DIFFERENCE,
+        WAIT_DIFFERENCE,
+        ISSUE_MULTIPLY,
+        WAIT_MULTIPLY,
+        ISSUE_FINAL_ADD,
+        WAIT_FINAL_ADD,
+        RESULT_PENDING
     } state_t;
 
     state_t state;
 
-    logic [31:0] z_reg;
-    logic [31:0] result_reg;
-    logic [15:0] neuron_reg;
-    rs_status_t status_reg;
+    logic [31:0] input_value_reg;
+    logic [31:0] result_value_reg;
 
-    // 257 узлов на [-8; 8], шаг 1/16.
-    logic [31:0] rom [0:256];
+    rs_status_t result_status_reg;
 
-    logic [8:0] rom_index;
-    logic [31:0] rom_a;
-    logic [31:0] rom_b;
+    // 257 значений sigmoid на [-8; 8], шаг 1/16.
+    logic [31:0] lookup_table [0:256];
 
-    logic [31:0] t_reg;
-    logic [31:0] diff_reg;
-    logic [31:0] product_reg;
+    logic [8:0] table_index_reg;
 
-    logic [20:0] coord;
+    logic [31:0] left_value_reg;
+    logic [31:0] right_value_reg;
 
-    logic [31:0] add_a;
-    logic [31:0] add_b;
+    logic [31:0] interpolation_weight_reg;
+    logic [31:0] interval_difference_reg;
+    logic [31:0] weighted_difference_reg;
+
+    logic [20:0] table_coordinate;
+
+    logic [31:0] add_operand_a;
+    logic [31:0] add_operand_b;
     logic [31:0] add_result;
-    logic add_valid;
-    logic add_out_valid;
 
-    logic [31:0] mul_result;
-    logic mul_valid;
-    logic mul_out_valid;
+    logic add_request_valid;
+    logic add_result_valid;
 
-    logic [2:0] reset_guard;
+    logic [31:0] multiply_result;
+
+    logic multiply_request_valid;
+    logic multiply_result_valid;
+
+    logic [2:0] reset_release_pipe;
 
     initial begin
-        $readmemh(ROM_FILE, rom);
+        $readmemh(ROM_FILE, lookup_table);
     end
 
     always_ff @(posedge clk_i or negedge rst_n_i) begin
         if (!rst_n_i)
-            reset_guard <= 0;
+            reset_release_pipe <= '0;
         else
-            reset_guard <= {reset_guard[1:0], 1'b1};
+            reset_release_pipe <= {
+                reset_release_pipe[1:0],
+                1'b1
+            };
     end
 
-    // Точное представление remainder / 4096 в FP32.
-    function automatic logic [31:0] fraction_fp32(
-        input logic [11:0] remainder
+    // Точное преобразование fraction_q12 / 4096 в FP32.
+    function automatic logic [31:0] fraction_to_fp32(
+        input logic [11:0] fraction_q12
     );
-        integer lead;
-        logic [31:0] shifted;
+        integer leading_bit;
+        logic [31:0] shifted_fraction;
 
-        if (remainder == 0)
+        if (fraction_q12 == 0)
             return 32'd0;
 
-        lead = 0;
+        leading_bit = 0;
 
         for (int i = 0; i < 12; i++) begin
-            if (remainder[i])
-                lead = i;
+            if (fraction_q12[i])
+                leading_bit = i;
         end
 
-        shifted = {20'd0, remainder} << (23 - lead);
+        shifted_fraction =
+            {20'd0, fraction_q12} << (23 - leading_bit);
 
         return {
             1'b0,
-            8'(115 + lead),
-            shifted[22:0]
+            8'(115 + leading_bit),
+            shifted_fraction[22:0]
         };
     endfunction
 
-    // Преобразование FP32 в Q5.16 с усечением к нулю.
-    // Затем сдвиг диапазона [-8; 8] в [0; 16].
-    function automatic logic [20:0] coordinate(
-        input logic [31:0] z
+    // Допустимый аргумент: [-8; 8].
+    // Преобразование в Q5.16 и сдвиг диапазона на +8.
+    function automatic logic [20:0] fp32_to_table_coordinate(
+        input logic [31:0] value
     );
-        logic [31:0] magnitude;
-        integer sh;
+        logic [31:0] magnitude_q16;
+        integer shift_count;
 
-        magnitude = 0;
+        magnitude_q16 = '0;
+        shift_count = 0;
 
-        if (z[30:23] != 0) begin
-            sh = 134 - int'({1'b0, z[30:23]});
+        if (value[30:23] != 0) begin
+            shift_count =
+                134 - int'({1'b0, value[30:23]});
 
-            if (sh < 24) begin
-                magnitude =
-                    {8'd0, 1'b1, z[22:0]} >> sh;
+            if (shift_count < 24) begin
+                magnitude_q16 =
+                    {8'd0, 1'b1, value[22:0]} >> shift_count;
             end
         end
 
-        if (z[31])
-            return 21'(32'd524288 - magnitude);
+        if (value[31])
+            return 21'(32'd524288 - magnitude_q16);
         else
-            return 21'(32'd524288 + magnitude);
+            return 21'(32'd524288 + magnitude_q16);
     endfunction
 
-    // Один сумматор используется для b-a и a+product.
     fp32_add_ip u_add (
-        .aclk                 (clk_i),
-        .aresetn              (rst_n_i),
+        .aclk(clk_i),
+        .aresetn(rst_n_i),
 
-        .s_axis_a_tvalid      (add_valid),
-        .s_axis_a_tdata       (add_a),
+        .s_axis_a_tvalid(add_request_valid),
+        .s_axis_a_tdata(add_operand_a),
 
-        .s_axis_b_tvalid      (add_valid),
-        .s_axis_b_tdata       (add_b),
+        .s_axis_b_tvalid(add_request_valid),
+        .s_axis_b_tdata(add_operand_b),
 
-        .m_axis_result_tvalid (add_out_valid),
-        .m_axis_result_tdata  (add_result)
+        .m_axis_result_tvalid(add_result_valid),
+        .m_axis_result_tdata(add_result)
     );
 
-    fp32_mul_ip u_mul (
-        .aclk                 (clk_i),
-        .aresetn              (rst_n_i),
+    fp32_mul_ip u_multiply (
+        .aclk(clk_i),
+        .aresetn(rst_n_i),
 
-        .s_axis_a_tvalid      (mul_valid),
-        .s_axis_a_tdata       (t_reg),
+        .s_axis_a_tvalid(multiply_request_valid),
+        .s_axis_a_tdata(interpolation_weight_reg),
 
-        .s_axis_b_tvalid      (mul_valid),
-        .s_axis_b_tdata       (diff_reg),
+        .s_axis_b_tvalid(multiply_request_valid),
+        .s_axis_b_tdata(interval_difference_reg),
 
-        .m_axis_result_tvalid (mul_out_valid),
-        .m_axis_result_tdata  (mul_result)
+        .m_axis_result_tvalid(multiply_result_valid),
+        .m_axis_result_tdata(multiply_result)
     );
+
+    assign input_ready_o =
+        (&reset_release_pipe) &&
+        (state == WAIT_INPUT);
+
+    assign result_data_o = result_value_reg;
+    assign result_status_o = result_status_reg;
+    assign result_valid_o = (state == RESULT_PENDING);
 
     always_comb begin
-        reduce_to_sigmoid_ready_o =
-            (&reset_guard) && (state == IDLE);
-
-        // В функцию адресации допускаем только |z| <= 8.
-        coord = coordinate(
-            (z_reg[30:0] <= 31'h41000000)
-                ? z_reg
+        table_coordinate = fp32_to_table_coordinate(
+            (input_value_reg[30:0] <= 31'h41000000)
+                ? input_value_reg
                 : 32'd0
         );
 
-        add_a = 0;
-        add_b = 0;
-        add_valid = 0;
+        add_operand_a = '0;
+        add_operand_b = '0;
+        add_request_valid = 1'b0;
 
-        if (state == DIFF_REQ) begin
-            add_a = rom_b;
+        if (state == ISSUE_DIFFERENCE) begin
+            add_operand_a = right_value_reg;
 
-            // b-a: инверсия знака a.
-            add_b = {~rom_a[31], rom_a[30:0]};
+            add_operand_b = {
+                ~left_value_reg[31],
+                left_value_reg[30:0]
+            };
 
-            add_valid = 1;
+            add_request_valid = 1'b1;
         end
 
-        if (state == FINAL_REQ) begin
-            add_a = rom_a;
-            add_b = product_reg;
-            add_valid = 1;
+        if (state == ISSUE_FINAL_ADD) begin
+            add_operand_a = left_value_reg;
+            add_operand_b = weighted_difference_reg;
+            add_request_valid = 1'b1;
         end
 
-        mul_valid = (state == MUL_REQ);
-
-        sigmoid_to_rs_data_o.neuron_id = neuron_reg;
-        sigmoid_to_rs_data_o.value     = result_reg;
-        sigmoid_to_rs_data_o.status    = status_reg;
-
-        sigmoid_to_rs_valid_o = (state == RESULT);
+        multiply_request_valid =
+            (state == ISSUE_MULTIPLY);
     end
 
-    // Два синхронных чтения ROM.
+    // Синхронное чтение двух соседних узлов таблицы.
     always_ff @(posedge clk_i) begin
-        if (state == ROM_READ) begin
-            rom_a <= rom[rom_index];
+        if (state == READ_TABLE) begin
+            left_value_reg <= lookup_table[table_index_reg];
 
-            rom_b <= rom[
-                (rom_index == 9'd256)
+            right_value_reg <= lookup_table[
+                (table_index_reg == 9'd256)
                     ? 9'd256
-                    : rom_index + 9'd1
+                    : table_index_reg + 9'd1
             ];
         end
     end
 
     always_ff @(posedge clk_i or negedge rst_n_i) begin
         if (!rst_n_i) begin
-            state       <= IDLE;
-            z_reg       <= 0;
-            result_reg  <= 0;
-            neuron_reg  <= 0;
-            status_reg  <= RS_OK;
+            state <= WAIT_INPUT;
 
-            rom_index   <= 0;
-            t_reg       <= 0;
-            diff_reg    <= 0;
-            product_reg <= 0;
+            input_value_reg <= '0;
+            result_value_reg <= '0;
+            result_status_reg <= RS_OK;
+
+            table_index_reg <= '0;
+
+            interpolation_weight_reg <= '0;
+            interval_difference_reg <= '0;
+            weighted_difference_reg <= '0;
 
         end else begin
             case (state)
 
-                IDLE: begin
-                    if (
-                        reduce_to_sigmoid_valid_i &&
-                        reduce_to_sigmoid_ready_o
-                    ) begin
-                        z_reg <= reduce_to_sigmoid_data_i.value;
-                        neuron_reg <=
-                            reduce_to_sigmoid_data_i.neuron_id;
-                        status_reg <=
-                            reduce_to_sigmoid_data_i.status;
+                WAIT_INPUT: begin
+                    if (input_valid_i && input_ready_o) begin
+                        input_value_reg <= input_data_i;
+                        result_status_reg <= input_status_i;
 
-                        result_reg  <= 0;
-                        t_reg       <= 0;
-                        diff_reg    <= 0;
-                        product_reg <= 0;
+                        result_value_reg <= '0;
+                        interpolation_weight_reg <= '0;
+                        interval_difference_reg <= '0;
+                        weighted_difference_reg <= '0;
 
-                        if (
-                            reduce_to_sigmoid_data_i.status != RS_OK
-                        ) begin
-                            state <= RESULT;
+                        if (input_status_i != RS_OK) begin
+                            state <= RESULT_PENDING;
 
                         end else if (
-                            reduce_to_sigmoid_data_i.value[30:23]
-                                == 8'hFF
+                            input_data_i[30:23] == 8'hFF
                         ) begin
-                            status_reg <= RS_NONFINITE;
-                            state <= RESULT;
+                            result_status_reg <= RS_NONFINITE;
+                            state <= RESULT_PENDING;
 
                         end else begin
-                            state <= DECODE;
+                            state <= PREPARE_LOOKUP;
                         end
                     end
                 end
 
-                DECODE: begin
-                    if (z_reg[30:0] > 31'h41000000) begin
-                        // За пределами [-8; 8].
-                        result_reg <= z_reg[31]
+                PREPARE_LOOKUP: begin
+                    if (
+                        input_value_reg[30:0] > 31'h41000000
+                    ) begin
+                        // Насыщение за пределами [-8; 8].
+                        result_value_reg <= input_value_reg[31]
                             ? 32'h00000000
                             : 32'h3F800000;
 
-                        state <= RESULT;
+                        state <= RESULT_PENDING;
 
                     end else begin
-                        rom_index <= coord[20:12];
-                        t_reg <= fraction_fp32(coord[11:0]);
+                        table_index_reg <=
+                            table_coordinate[20:12];
 
-                        state <= ROM_READ;
+                        interpolation_weight_reg <=
+                            fraction_to_fp32(
+                                table_coordinate[11:0]
+                            );
+
+                        state <= READ_TABLE;
                     end
                 end
 
-                ROM_READ: begin
-                    state <= ROM_READY;
+                READ_TABLE: begin
+                    state <= WAIT_TABLE_DATA;
                 end
 
-                ROM_READY: begin
-                    if (rom_index == 9'd256) begin
-                        // Аргумент ровно +8.
-                        result_reg <= rom_a;
-                        state <= RESULT;
+                WAIT_TABLE_DATA: begin
+                    if (table_index_reg == 9'd256) begin
+                        result_value_reg <= left_value_reg;
+                        state <= RESULT_PENDING;
                     end else begin
-                        state <= DIFF_REQ;
+                        state <= ISSUE_DIFFERENCE;
                     end
                 end
 
-                DIFF_REQ: begin
-                    state <= DIFF_WAIT;
+                ISSUE_DIFFERENCE: begin
+                    state <= WAIT_DIFFERENCE;
                 end
 
-                DIFF_WAIT: begin
-                    if (add_out_valid) begin
+                WAIT_DIFFERENCE: begin
+                    if (add_result_valid) begin
                         if (add_result[30:23] == 8'hFF) begin
-                            status_reg <= RS_ARITH_ERROR;
-                            state <= RESULT;
+                            result_status_reg <= RS_ARITH_ERROR;
+                            state <= RESULT_PENDING;
                         end else begin
-                            diff_reg <= add_result;
-                            state <= MUL_REQ;
+                            interval_difference_reg <= add_result;
+                            state <= ISSUE_MULTIPLY;
                         end
                     end
                 end
 
-                MUL_REQ: begin
-                    state <= MUL_WAIT;
+                ISSUE_MULTIPLY: begin
+                    state <= WAIT_MULTIPLY;
                 end
 
-                MUL_WAIT: begin
-                    if (mul_out_valid) begin
-                        if (mul_result[30:23] == 8'hFF) begin
-                            status_reg <= RS_ARITH_ERROR;
-                            state <= RESULT;
+                WAIT_MULTIPLY: begin
+                    if (multiply_result_valid) begin
+                        if (
+                            multiply_result[30:23] == 8'hFF
+                        ) begin
+                            result_status_reg <= RS_ARITH_ERROR;
+                            state <= RESULT_PENDING;
                         end else begin
-                            product_reg <= mul_result;
-                            state <= FINAL_REQ;
+                            weighted_difference_reg <=
+                                multiply_result;
+
+                            state <= ISSUE_FINAL_ADD;
                         end
                     end
                 end
 
-                FINAL_REQ: begin
-                    state <= FINAL_WAIT;
+                ISSUE_FINAL_ADD: begin
+                    state <= WAIT_FINAL_ADD;
                 end
 
-                FINAL_WAIT: begin
-                    if (add_out_valid) begin
+                WAIT_FINAL_ADD: begin
+                    if (add_result_valid) begin
                         if (add_result[30:23] == 8'hFF)
-                            status_reg <= RS_ARITH_ERROR;
+                            result_status_reg <= RS_ARITH_ERROR;
                         else
-                            result_reg <= add_result;
+                            result_value_reg <= add_result;
 
-                        state <= RESULT;
+                        state <= RESULT_PENDING;
                     end
                 end
 
-                RESULT: begin
-                    if (
-                        sigmoid_to_rs_valid_o &&
-                        sigmoid_to_rs_ready_i
-                    ) begin
-                        state <= IDLE;
-                    end
+                RESULT_PENDING: begin
+                    if (result_valid_o && result_ready_i)
+                        state <= WAIT_INPUT;
                 end
 
-                default: state <= IDLE;
+                default: begin
+                    state <= WAIT_INPUT;
+                end
 
             endcase
         end

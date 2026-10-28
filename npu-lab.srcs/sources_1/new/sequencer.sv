@@ -4,6 +4,7 @@ module sequencer #(
     parameter int N_PE = 6,
     parameter int MAX_LAYERS = 8,
     parameter int MAX_NEURONS = 49,
+
     parameter int LOCAL_WORDS = 2048,
     parameter int MAX_WEIGHT_WORDS = 1900,
     parameter int SHARED_BYTES = 16384,
@@ -14,42 +15,54 @@ module sequencer #(
     input logic clk_i,
     input logic rst_n_i,
 
-    input  io_types_pkg::io_to_seq_t io_to_seq_data_i,
-    input  logic io_to_seq_valid_i,
+    // IO -> секвенсор.
+    input io_types_pkg::io_to_seq_t io_to_seq_data_i,
+    input logic io_to_seq_valid_i,
     output logic io_to_seq_ready_o,
 
+    // Секвенсор -> IO.
     output io_types_pkg::seq_to_io_t seq_to_io_data_o,
     output logic seq_to_io_valid_o,
-    input  logic seq_to_io_ready_i,
+    input logic seq_to_io_ready_i,
 
+    // Секвенсор -> shared memory: запрос.
     output memory_types_pkg::mem_req_t seq_to_mem_data_o,
     output logic seq_to_mem_valid_o,
-    input  logic seq_to_mem_ready_i,
+    input logic seq_to_mem_ready_i,
 
-    input  memory_types_pkg::mem_rsp_t mem_to_seq_data_i,
-    input  logic mem_to_seq_valid_i,
+    // Shared memory -> секвенсор: ответ.
+    input memory_types_pkg::mem_rsp_t mem_to_seq_data_i,
+    input logic mem_to_seq_valid_i,
     output logic mem_to_seq_ready_o,
 
+    // Секвенсор -> PE: команды.
     output pe_types_pkg::seq_to_pe_t
-        seq_to_pe_data_o [0:N_PE-1],
+        seq_to_pe_command_o [0:N_PE-1],
 
-    output logic [N_PE-1:0] seq_to_pe_valid_o,
-    input  logic [N_PE-1:0] seq_to_pe_ready_i,
+    output logic [N_PE-1:0] seq_to_pe_command_valid_o,
+    input logic [N_PE-1:0] pe_to_seq_command_ready_i,
 
-    input logic [N_PE-1:0] pe_done_i,
+    // PE -> секвенсор: состояние вычислений и текущей суммы.
+    input logic [N_PE-1:0] pe_to_seq_layer_done_i,
+    input logic [N_PE-1:0] pe_to_seq_sum_valid_i,
 
     input pe_types_pkg::pe_status_t
-        pe_status_i [0:N_PE-1],
+        pe_to_seq_status_i [0:N_PE-1],
 
-    output rs_types_pkg::seq_to_rs_t seq_to_rs_data_o,
+    // Секвенсор -> reduce_sigmoid: bias и запуск.
+    output logic [31:0] seq_to_rs_bias_o,
     output logic seq_to_rs_start_o,
-    input  logic seq_to_rs_ready_i,
+    input logic rs_to_seq_start_ready_i,
 
-    input  rs_types_pkg::rs_to_seq_t rs_to_seq_data_i,
-    input  logic rs_to_seq_valid_i,
-    output logic rs_to_seq_ready_o,
+    // Reduce_sigmoid -> секвенсор: результат.
+    input logic [31:0] rs_to_seq_result_data_i,
+    input rs_types_pkg::rs_status_t rs_to_seq_result_status_i,
+    input logic rs_to_seq_result_valid_i,
+    output logic seq_to_rs_result_ready_o,
 
+    // Сброс вычислительных блоков.
     output logic compute_rst_n_o,
+
     output logic model_valid_o,
     output logic busy_o
 );
@@ -140,8 +153,10 @@ module sequencer #(
     wire [N_PE-1:0] pe_fault;
 
     for (genvar p = 0; p < N_PE; p++) begin : g_pe
-        assign seq_to_pe_data_o[p] = pe_command;
-        assign pe_fault[p] = (pe_status_i[p] != PE_OK);
+        assign seq_to_pe_command_o[p] = pe_command;
+
+        assign pe_fault[p] =
+            (pe_to_seq_status_i[p] != PE_OK);
     end
 
     logic [2:0] reset_count;
@@ -150,6 +165,7 @@ module sequencer #(
     logic model_valid;
     logic input_valid;
     logic results_valid;
+
     logic model_loading;
     logic input_loading;
 
@@ -211,10 +227,11 @@ module sequencer #(
     logic [31:0] rx_length;
     logic [31:0] rx_remaining;
     logic [31:0] rx_received;
-
-    logic [7:0] rx_error;
     logic [31:0] rx_word;
 
+    logic [7:0] rx_error;
+
+    // Комбинационные значения для проверки дескриптора.
     logic [15:0] dn;
     logic [15:0] dm;
 
@@ -229,7 +246,6 @@ module sequencer #(
 
     logic desc_ok;
 
-    // CRC-32/ISO-HDLC: один байт.
     function automatic logic [31:0] crc_byte(
         input logic [31:0] c0,
         input logic [7:0] b
@@ -245,7 +261,6 @@ module sequencer #(
         return c;
     endfunction
 
-    // Четыре байта, младший байт первым.
     function automatic logic [31:0] crc_word(
         input logic [31:0] c0,
         input logic [31:0] w
@@ -269,14 +284,12 @@ module sequencer #(
         return a < be && b < ae;
     endfunction
 
-    // Эти задачи описывают переходы FSM и присваивания регистрам.
-    // Они не содержат задержек и ожиданий.
     task automatic read_memory(
         input logic [31:0] addr,
         input state_t next_state
     );
         mem_command.write <= 1'b0;
-        mem_command.addr  <= addr;
+        mem_command.addr <= addr;
         mem_command.value <= '0;
 
         mem_return <= next_state;
@@ -289,7 +302,7 @@ module sequencer #(
         input state_t next_state
     );
         mem_command.write <= 1'b1;
-        mem_command.addr  <= addr;
+        mem_command.addr <= addr;
         mem_command.value <= value;
 
         mem_return <= next_state;
@@ -300,7 +313,7 @@ module sequencer #(
         input logic [7:0] status,
         input logic [31:0] value
     );
-        response.status      <= status;
+        response.status <= status;
         response.next_offset <= value;
         state <= REPLY;
     endtask
@@ -309,13 +322,13 @@ module sequencer #(
         input logic [7:0] status,
         input logic invalidate_model
     );
-        response.status      <= status;
+        response.status <= status;
         response.next_offset <= '0;
 
         if (invalidate_model)
             model_valid <= 1'b0;
 
-        input_valid   <= 1'b0;
+        input_valid <= 1'b0;
         results_valid <= 1'b0;
         model_loading <= 1'b0;
         input_loading <= 1'b0;
@@ -339,48 +352,60 @@ module sequencer #(
         io_to_seq_ready_o =
             (state == IDLE || state == RX_WORD);
 
-        seq_to_io_data_o  = response;
+        seq_to_io_data_o = response;
         seq_to_io_valid_o = (state == REPLY);
 
-        seq_to_mem_data_o  = mem_command;
+        seq_to_mem_data_o = mem_command;
         seq_to_mem_valid_o = (state == MEM_REQ);
         mem_to_seq_ready_o = (state == MEM_WAIT);
 
-        seq_to_pe_valid_o =
+        seq_to_pe_command_valid_o =
             (state == PE_SEND) ? pending_pe : '0;
 
-        seq_to_rs_data_o.neuron_id = 16'(neuron_index);
-        seq_to_rs_data_o.bias = bias_reg;
+        seq_to_rs_bias_o = bias_reg;
 
-        seq_to_rs_start_o = (state == RS_START);
-        rs_to_seq_ready_o = (state == RS_WAIT);
+        // Start разрешён только после выставления
+        // текущей суммы всеми PE.
+        seq_to_rs_start_o =
+            (state == RS_START) &&
+            (&pe_to_seq_sum_valid_i);
 
-        compute_rst_n_o = rst_n_i && compute_reset_reg;
+        seq_to_rs_result_ready_o =
+            (state == RS_WAIT);
+
+        compute_rst_n_o =
+            rst_n_i && compute_reset_reg;
 
         model_valid_o = model_valid;
         busy_o = (state != IDLE);
 
-        // Проверка текущего дескриптора слоя.
         dn = descriptor[1][15:0];
         dm = descriptor[1][31:16];
 
         dtotal = {16'd0, dn} * {16'd0, dm};
-        dreserve = (dtotal + 32'(N_PE-1)) / 32'(N_PE);
 
-        dend = {32'd0, descriptor_offset}
-             + ({48'd0, layer_count} << 5);
+        dreserve =
+            (dtotal + 32'(N_PE-1)) / 32'(N_PE);
 
-        w_end = {32'd0, descriptor[2]}
-              + ({32'd0, dtotal} << 2);
+        dend =
+            {32'd0, descriptor_offset} +
+            ({48'd0, layer_count} << 5);
 
-        b_end = {32'd0, descriptor[3]}
-              + ({48'd0, dm} << 2);
+        w_end =
+            {32'd0, descriptor[2]} +
+            ({32'd0, dtotal} << 2);
 
-        in_end = {32'd0, descriptor[4]}
-               + ({48'd0, dn} << 2);
+        b_end =
+            {32'd0, descriptor[3]} +
+            ({48'd0, dm} << 2);
 
-        out_end = {32'd0, descriptor[5]}
-                + ({48'd0, dm} << 2);
+        in_end =
+            {32'd0, descriptor[4]} +
+            ({48'd0, dn} << 2);
+
+        out_end =
+            {32'd0, descriptor[5]} +
+            ({48'd0, dm} << 2);
 
         desc_ok =
             descriptor[0] == 32'h00010101 &&
@@ -413,7 +438,7 @@ module sequencer #(
             descriptor[4] >= MODEL_LIMIT &&
             descriptor[5] >= MODEL_LIMIT &&
 
-            in_end  <= 64'(SHARED_BYTES) &&
+            in_end <= 64'(SHARED_BYTES) &&
             out_end <= 64'(SHARED_BYTES) &&
 
             !overlap(
@@ -436,16 +461,19 @@ module sequencer #(
             reserved_weights + dreserve
                 <= 32'(MAX_WEIGHT_WORDS) &&
 
-            reserved_weights + dreserve
-                + 32'(2*MAX_NEURONS)
+            reserved_weights + dreserve +
+                32'(2*MAX_NEURONS)
                 <= 32'(LOCAL_WORDS);
 
-        if (layer_index == 0)
-            desc_ok = desc_ok && dn == model_inputs;
-        else if (layer_index < MAX_LAYERS)
-            desc_ok = desc_ok &&
+        if (layer_index == 0) begin
+            desc_ok =
+                desc_ok && dn == model_inputs;
+        end else if (layer_index < MAX_LAYERS) begin
+            desc_ok =
+                desc_ok &&
                 dn == layer_m[layer_index-1] &&
                 descriptor[4] == output_addr[layer_index-1];
+        end
 
         if (layer_index == int'(layer_count)-1)
             desc_ok = desc_ok && dm == model_outputs;
@@ -499,6 +527,7 @@ module sequencer #(
 
             first_i <= '0;
             first_j <= '0;
+
             best_value <= '0;
             best_class <= '0;
             bias_reg <= '0;
@@ -519,17 +548,23 @@ module sequencer #(
             for (int j = 0; j < MAX_LAYERS; j++) begin
                 layer_n[j] <= '0;
                 layer_m[j] <= '0;
+
                 weight_offset[j] <= '0;
                 bias_offset[j] <= '0;
+
                 input_addr[j] <= '0;
                 output_addr[j] <= '0;
+
                 local_w_base[j] <= '0;
                 weight_count[j] <= '0;
+
                 quota[j] <= '0;
                 remainder[j] <= '0;
+
                 i_step[j] <= '0;
                 j_step[j] <= '0;
             end
+
         end else begin
             case (state)
 
@@ -544,9 +579,7 @@ module sequencer #(
                 end
 
                 IDLE: begin
-                    if (io_to_seq_valid_i &&
-                        io_to_seq_ready_o) begin
-
+                    if (io_to_seq_valid_i && io_to_seq_ready_o) begin
                         response.seq <= io_to_seq_data_i.seq;
 
                         if (!io_to_seq_data_i.is_header) begin
@@ -593,11 +626,13 @@ module sequencer #(
 
                                     if (!model_valid || model_loading) begin
                                         reply(STATUS_BAD_STATE, 0);
+
                                     end else if (
                                         io_to_seq_data_i.image_size !=
                                         ({16'd0, model_inputs} << 2)
                                     ) begin
                                         reply(STATUS_BAD_SIZE, 0);
+
                                     end else begin
                                         input_loading <= 1'b1;
                                         reply(STATUS_OK, 0);
@@ -610,18 +645,23 @@ module sequencer #(
                                         (io_to_seq_data_i.cmd == CMD_INPUT_DATA);
 
                                     rx_offset <= io_to_seq_data_i.offset;
-                                    rx_length <=
-                                        {16'd0, io_to_seq_data_i.data_length};
 
-                                    rx_remaining <=
-                                        {16'd0, io_to_seq_data_i.data_length};
+                                    rx_length <= {
+                                        16'd0,
+                                        io_to_seq_data_i.data_length
+                                    };
+
+                                    rx_remaining <= {
+                                        16'd0,
+                                        io_to_seq_data_i.data_length
+                                    };
 
                                     rx_received <= '0;
                                     rx_error <= STATUS_OK;
 
-                                    if (io_to_seq_data_i.cmd ==
-                                        CMD_CONFIG_DATA) begin
-
+                                    if (
+                                        io_to_seq_data_i.cmd == CMD_CONFIG_DATA
+                                    ) begin
                                         if (!model_loading)
                                             rx_error <= STATUS_BAD_STATE;
 
@@ -639,7 +679,6 @@ module sequencer #(
                                             rx_error <= STATUS_BAD_SIZE;
 
                                     end else begin
-
                                         if (!input_loading || !model_valid)
                                             rx_error <= STATUS_BAD_STATE;
 
@@ -670,8 +709,10 @@ module sequencer #(
                                 end
 
                                 CMD_CONFIG_END: begin
-                                    if (!model_loading ||
-                                        image_loaded != image_size) begin
+                                    if (
+                                        !model_loading ||
+                                        image_loaded != image_size
+                                    ) begin
                                         reply(STATUS_BAD_STATE, image_loaded);
                                     end else begin
                                         word_index <= 0;
@@ -710,12 +751,14 @@ module sequencer #(
                                 CMD_READ_WORD: begin
                                     if (!results_valid) begin
                                         reply(STATUS_BAD_STATE, 0);
+
                                     end else if (
                                         io_to_seq_data_i.offset[1:0] != 0 ||
                                         io_to_seq_data_i.offset >=
-                                        32'(SHARED_BYTES)
+                                            32'(SHARED_BYTES)
                                     ) begin
                                         reply(STATUS_BAD_OFFSET, 0);
+
                                     end else begin
                                         read_memory(
                                             io_to_seq_data_i.offset,
@@ -738,9 +781,7 @@ module sequencer #(
                 end
 
                 RX_WORD: begin
-                    if (io_to_seq_valid_i &&
-                        io_to_seq_ready_o) begin
-
+                    if (io_to_seq_valid_i && io_to_seq_ready_o) begin
                         rx_word <= io_to_seq_data_i.word;
 
                         if (rx_error != STATUS_OK) begin
@@ -756,8 +797,8 @@ module sequencer #(
 
                         end else begin
                             write_memory(
-                                (rx_is_input ? input_addr[0] : 0)
-                                    + rx_offset + rx_received,
+                                (rx_is_input ? input_addr[0] : 0) +
+                                    rx_offset + rx_received,
                                 io_to_seq_data_i.word,
                                 RX_AFTER_WRITE
                             );
@@ -765,8 +806,9 @@ module sequencer #(
                     end
                 end
 
-                RX_AFTER_WRITE:
+                RX_AFTER_WRITE: begin
                     state <= RX_NEXT;
+                end
 
                 RX_NEXT: begin
                     if (rx_remaining <= 4) begin
@@ -777,6 +819,7 @@ module sequencer #(
                                 image_loaded <= image_loaded + rx_length;
 
                             reply(STATUS_OK, rx_offset + rx_length);
+
                         end else begin
                             reply(
                                 rx_error,
@@ -796,12 +839,10 @@ module sequencer #(
                 end
 
                 MEM_WAIT: begin
-                    if (mem_to_seq_valid_i &&
-                        mem_to_seq_ready_o) begin
-
+                    if (mem_to_seq_valid_i && mem_to_seq_ready_o) begin
                         if (mem_to_seq_data_i.error) begin
                             if (mem_return == RX_AFTER_WRITE) begin
-                                // Дочитываем остаток пакета перед ответом.
+                                // Сначала дочитываем остаток пакета.
                                 rx_error <= STATUS_MEMORY_ERROR;
                                 state <= RX_NEXT;
                             end else begin
@@ -819,22 +860,28 @@ module sequencer #(
                         fail(STATUS_PE_ERROR, model_loading);
                     end else begin
                         pending_pe <=
-                            pending_pe & ~seq_to_pe_ready_i;
+                            pending_pe & ~pe_to_seq_command_ready_i;
 
-                        if ((pending_pe & ~seq_to_pe_ready_i) == 0)
+                        if (
+                            (pending_pe & ~pe_to_seq_command_ready_i) == 0
+                        )
                             state <= pe_return;
                     end
                 end
 
-                HDR_READ:
-                    read_memory(32'(word_index) << 2, HDR_GOT);
+                HDR_READ: begin
+                    read_memory(
+                        32'(word_index) << 2,
+                        HDR_GOT
+                    );
+                end
 
                 HDR_GOT: begin
                     header[word_index] <= memory_value;
 
-                    if (word_index == 7)
+                    if (word_index == 7) begin
                         state <= HDR_CHECK;
-                    else begin
+                    end else begin
                         word_index <= word_index + 1;
                         state <= HDR_READ;
                     end
@@ -881,17 +928,23 @@ module sequencer #(
                     end
                 end
 
-                CRC_READ:
-                    read_memory(32'(word_index) << 2, CRC_GOT);
+                CRC_READ: begin
+                    read_memory(
+                        32'(word_index) << 2,
+                        CRC_GOT
+                    );
+                end
 
                 CRC_GOT: begin
-                    // Поле CRC самого образа при расчёте считается нулём.
+                    // Поле CRC самого образа считается нулём.
                     crc_reg <= crc_word(
                         crc_reg,
                         (word_index == 6) ? 32'd0 : memory_value
                     );
 
-                    if (((32'(word_index) + 1) << 2) == image_size) begin
+                    if (
+                        ((32'(word_index) + 1) << 2) == image_size
+                    ) begin
                         if (
                             (
                                 crc_word(
@@ -926,9 +979,9 @@ module sequencer #(
                 DESC_GOT: begin
                     descriptor[word_index] <= memory_value;
 
-                    if (word_index == 7)
+                    if (word_index == 7) begin
                         state <= DESC_CHECK;
-                    else begin
+                    end else begin
                         word_index <= word_index + 1;
                         state <= DESC_READ;
                     end
@@ -952,11 +1005,17 @@ module sequencer #(
 
                         weight_count[layer_index] <= dtotal;
 
-                        quota[layer_index] <= dtotal / 32'(N_PE);
-                        remainder[layer_index] <= dtotal % 32'(N_PE);
+                        quota[layer_index] <=
+                            dtotal / 32'(N_PE);
 
-                        i_step[layer_index] <= 16'(N_PE / int'(dm));
-                        j_step[layer_index] <= 16'(N_PE % int'(dm));
+                        remainder[layer_index] <=
+                            dtotal % 32'(N_PE);
+
+                        i_step[layer_index] <=
+                            16'(N_PE / int'(dm));
+
+                        j_step[layer_index] <=
+                            16'(N_PE % int'(dm));
 
                         reserved_weights <=
                             reserved_weights + dreserve;
@@ -1018,9 +1077,10 @@ module sequencer #(
                 end
 
                 WEIGHT_NEXT: begin
-                    if (word_index ==
-                        int'(weight_count[layer_index])-1) begin
-
+                    if (
+                        word_index ==
+                        int'(weight_count[layer_index])-1
+                    ) begin
                         state <= BIAS_VALIDATE_BEGIN;
                     end else begin
                         word_index <= word_index + 1;
@@ -1052,6 +1112,7 @@ module sequencer #(
                 BIAS_VALIDATE_GOT: begin
                     if (memory_value[30:23] == 8'hFF) begin
                         fail(STATUS_BAD_MODEL, 1'b1);
+
                     end else if (
                         neuron_index == int'(layer_m[layer_index])-1
                     ) begin
@@ -1088,20 +1149,23 @@ module sequencer #(
                     if (memory_value[30:23] == 8'hFF) begin
                         input_loading <= 1'b0;
                         reply(STATUS_BAD_STREAM, 0);
+
                     end else if (
                         input_index == int'(model_inputs)-1
                     ) begin
                         input_valid <= 1'b1;
                         input_loading <= 1'b0;
                         reply(STATUS_OK, input_loaded);
+
                     end else begin
                         input_index <= input_index + 1;
                         state <= INPUT_CHECK_READ;
                     end
                 end
 
-                READ_REPLY:
+                READ_REPLY: begin
                     reply(STATUS_OK, memory_value);
+                end
 
                 RUN_BEGIN: begin
                     layer_index <= 0;
@@ -1161,9 +1225,9 @@ module sequencer #(
                     end else begin
                         pe_index <= pe_index + 1;
 
-                        if (first_j ==
-                            layer_m[layer_index] - 16'd1) begin
-
+                        if (
+                            first_j == layer_m[layer_index] - 16'd1
+                        ) begin
                             first_j <= 0;
                             first_i <= first_i + 16'd1;
                         end else begin
@@ -1200,9 +1264,9 @@ module sequencer #(
                 end
 
                 X_NEXT: begin
-                    if (input_index ==
-                        int'(layer_n[layer_index])-1) begin
-
+                    if (
+                        input_index == int'(layer_n[layer_index])-1
+                    ) begin
                         state <= START_PES;
                     end else begin
                         input_index <= input_index + 1;
@@ -1220,7 +1284,7 @@ module sequencer #(
                 WAIT_PES: begin
                     if (|pe_fault) begin
                         fail(STATUS_PE_ERROR, 1'b0);
-                    end else if (&pe_done_i) begin
+                    end else if (&pe_to_seq_layer_done_i) begin
                         neuron_index <= 0;
                         state <= BIAS_READ;
                     end
@@ -1242,9 +1306,10 @@ module sequencer #(
                 RS_START: begin
                     if (|pe_fault) begin
                         fail(STATUS_PE_ERROR, 1'b0);
+
                     end else if (
                         seq_to_rs_start_o &&
-                        seq_to_rs_ready_i
+                        rs_to_seq_start_ready_i
                     ) begin
                         state <= RS_WAIT;
                     end
@@ -1253,35 +1318,34 @@ module sequencer #(
                 RS_WAIT: begin
                     if (|pe_fault) begin
                         fail(STATUS_PE_ERROR, 1'b0);
+
                     end else if (
-                        rs_to_seq_valid_i &&
-                        rs_to_seq_ready_o
+                        rs_to_seq_result_valid_i &&
+                        seq_to_rs_result_ready_o
                     ) begin
                         if (
-                            rs_to_seq_data_i.status != RS_OK ||
-                            rs_to_seq_data_i.neuron_id !=
-                                16'(neuron_index) ||
-                            rs_to_seq_data_i.value[30:23] == 8'hFF
+                            rs_to_seq_result_status_i != RS_OK ||
+                            rs_to_seq_result_data_i[30:23] == 8'hFF
                         ) begin
                             fail(STATUS_COMPUTE_ERROR, 1'b0);
                         end else begin
-                            // Выход sigmoid неотрицателен:
-                            // сравнение битовых представлений даёт argmax.
+                            // Sigmoid выдаёт неотрицательные значения.
+                            // При равенстве сохраняется меньший индекс.
                             if (
                                 layer_index == int'(layer_count)-1 &&
                                 (
                                     neuron_index == 0 ||
-                                    rs_to_seq_data_i.value > best_value
+                                    rs_to_seq_result_data_i > best_value
                                 )
                             ) begin
-                                best_value <= rs_to_seq_data_i.value;
+                                best_value <= rs_to_seq_result_data_i;
                                 best_class <= 32'(neuron_index);
                             end
 
                             write_memory(
                                 output_addr[layer_index] +
                                 (32'(neuron_index) << 2),
-                                rs_to_seq_data_i.value,
+                                rs_to_seq_result_data_i,
                                 RESULT_STORED
                             );
                         end
@@ -1289,9 +1353,11 @@ module sequencer #(
                 end
 
                 RESULT_STORED: begin
-                    if (neuron_index ==
-                        int'(layer_m[layer_index])-1) begin
-
+                    // Это состояние достигается только после
+                    // успешного ответа памяти на запись результата.
+                    if (
+                        neuron_index == int'(layer_m[layer_index])-1
+                    ) begin
                         if (layer_index == int'(layer_count)-1) begin
                             record_index <= 0;
                             state <= WRITE_RECORD;
@@ -1318,6 +1384,7 @@ module sequencer #(
 
                 WRITE_RECORD: begin
                     case (record_index)
+
                         0: write_memory(
                             RESULT_RECORD,
                             best_class,
@@ -1344,13 +1411,18 @@ module sequencer #(
 
                         default:
                             fail(STATUS_COMPUTE_ERROR, 1'b0);
+
                     endcase
                 end
 
                 RECORD_NEXT: begin
                     if (record_index == 3) begin
                         results_valid <= 1'b1;
-                        reply(STATUS_OK, output_addr[layer_index]);
+
+                        reply(
+                            STATUS_OK,
+                            output_addr[layer_index]
+                        );
                     end else begin
                         record_index <= record_index + 1;
                         state <= WRITE_RECORD;

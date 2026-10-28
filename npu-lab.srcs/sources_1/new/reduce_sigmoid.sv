@@ -7,85 +7,87 @@ module reduce_sigmoid #(
     input logic clk_i,
     input logic rst_n_i,
 
-    input rs_types_pkg::seq_to_rs_t seq_to_rs_data_i,
-    input  logic seq_to_rs_start_i,
-    output logic seq_to_rs_ready_o,
+    // Частичные суммы одного нейрона от всех PE.
+    input logic [31:0] pe_sums_i [0:N_PE-1],
 
-    input rs_types_pkg::pe_to_rs_t
-        pe_to_rs_data_i [0:N_PE-1],
+    // Управление от секвенсора.
+    input  logic [31:0] seq_bias_i,
+    input  logic seq_start_i,
+    output logic seq_start_ready_o,
 
-    input  logic [N_PE-1:0] pe_to_rs_valid_i,
-    output logic [N_PE-1:0] pe_to_rs_ready_o,
-
-    output rs_types_pkg::rs_to_seq_t rs_to_seq_data_o,
-    output logic rs_to_seq_valid_o,
-    input  logic rs_to_seq_ready_i
+    // Итоговый результат для секвенсора.
+    output logic [31:0] seq_result_data_o,
+    output rs_types_pkg::rs_status_t seq_result_status_o,
+    output logic seq_result_valid_o,
+    input  logic seq_result_ready_i
 );
 
-    rs_types_pkg::rs_to_seq_t reduce_data;
+    logic request_active;
 
-    logic reduce_ready;
-    logic reduce_valid;
-    logic sigmoid_ready;
+    logic start_accepted;
+    logic result_accepted;
 
-    logic busy;
+    logic reduction_start_ready;
 
-    // Новый запрос разрешается после приёма
-    // результата предыдущего нейрона.
-    assign seq_to_rs_ready_o = !busy && reduce_ready;
+    logic [31:0] reduction_result_data;
+    rs_types_pkg::rs_status_t reduction_result_status;
+
+    logic reduction_result_valid;
+    logic activation_input_ready;
+
+    assign seq_start_ready_o =
+        rst_n_i &&
+        !request_active &&
+        reduction_start_ready;
+
+    assign start_accepted =
+        seq_start_i && seq_start_ready_o;
+
+    assign result_accepted =
+        seq_result_valid_o && seq_result_ready_i;
 
     reduce #(
         .N_PE(N_PE)
     ) u_reduce (
-        .clk_i  (clk_i),
+        .clk_i(clk_i),
         .rst_n_i(rst_n_i),
 
-        .seq_to_reduce_data_i(seq_to_rs_data_i),
-        .seq_to_reduce_start_i(
-            seq_to_rs_start_i && !busy
-        ),
-        .seq_to_reduce_ready_o(reduce_ready),
+        .pe_sums_i(pe_sums_i),
+        .bias_i(seq_bias_i),
 
-        .pe_to_reduce_data_i (pe_to_rs_data_i),
-        .pe_to_reduce_valid_i(pe_to_rs_valid_i),
-        .pe_to_reduce_ready_o(pe_to_rs_ready_o),
+        .start_i(start_accepted),
+        .start_ready_o(reduction_start_ready),
 
-        .reduce_to_sigmoid_data_o (reduce_data),
-        .reduce_to_sigmoid_valid_o(reduce_valid),
-        .reduce_to_sigmoid_ready_i(sigmoid_ready)
+        .result_data_o(reduction_result_data),
+        .result_status_o(reduction_result_status),
+        .result_valid_o(reduction_result_valid),
+        .result_ready_i(activation_input_ready)
     );
 
     sigmoid #(
         .ROM_FILE(ROM_FILE)
     ) u_sigmoid (
-        .clk_i  (clk_i),
+        .clk_i(clk_i),
         .rst_n_i(rst_n_i),
 
-        .reduce_to_sigmoid_data_i (reduce_data),
-        .reduce_to_sigmoid_valid_i(reduce_valid),
-        .reduce_to_sigmoid_ready_o(sigmoid_ready),
+        .input_data_i(reduction_result_data),
+        .input_status_i(reduction_result_status),
+        .input_valid_i(reduction_result_valid),
+        .input_ready_o(activation_input_ready),
 
-        .sigmoid_to_rs_data_o (rs_to_seq_data_o),
-        .sigmoid_to_rs_valid_o(rs_to_seq_valid_o),
-        .sigmoid_to_rs_ready_i(rs_to_seq_ready_i)
+        .result_data_o(seq_result_data_o),
+        .result_status_o(seq_result_status_o),
+        .result_valid_o(seq_result_valid_o),
+        .result_ready_i(seq_result_ready_i)
     );
 
     always_ff @(posedge clk_i or negedge rst_n_i) begin
-        if (!rst_n_i) begin
-            busy <= 0;
-
-        end else if (
-            seq_to_rs_start_i &&
-            seq_to_rs_ready_o
-        ) begin
-            busy <= 1;
-
-        end else if (
-            rs_to_seq_valid_o &&
-            rs_to_seq_ready_i
-        ) begin
-            busy <= 0;
-        end
+        if (!rst_n_i)
+            request_active <= 1'b0;
+        else if (start_accepted)
+            request_active <= 1'b1;
+        else if (result_accepted)
+            request_active <= 1'b0;
     end
 
 endmodule

@@ -12,198 +12,257 @@ module tb_sequencer #(
     logic clk = 0;
     always #5 clk = ~clk;
 
-    logic rst = 0;
+    logic rst_n = 0;
 
-    io_to_seq_t host_data;
+    // Эмуляция интерфейса IO -> секвенсор.
+    io_to_seq_t io_to_seq_request;
+    logic io_to_seq_request_valid = 0;
+    logic seq_to_io_request_ready;
 
-    logic host_valid = 0;
-    logic host_ready;
+    // Ответ секвенсора эмулятору IO.
+    seq_to_io_t seq_to_io_response;
+    logic seq_to_io_response_valid;
+    logic io_to_seq_response_ready = 0;
 
-    logic reply_valid;
-    logic reply_ready = 0;
+    seq_to_io_t held_io_response;
+    logic io_response_stalled_reg = 0;
 
-    seq_to_io_t response;
-    seq_to_io_t held_response;
+    // Интерфейс shared memory со стороны секвенсора.
+    wire mem_req_t seq_to_shared_mem_request;
+    wire seq_to_shared_mem_request_valid;
+    wire shared_mem_to_seq_request_ready;
 
-    wire mem_req_t mreq;
-    wire mem_rsp_t mrsp;
-    wire mem_rsp_t raw_mrsp;
+    wire mem_rsp_t shared_mem_to_seq_response;
+    wire shared_mem_to_seq_response_valid;
+    wire seq_to_shared_mem_response_ready;
 
+    // Интерфейс памяти до искусственных задержек.
+    wire mem_rsp_t memory_response_ungated;
+    wire memory_request_ready_ungated;
+    wire memory_response_valid_ungated;
+    wire memory_response_ready_gated;
+
+    // Внесение ошибки ответа на запись по адресу 0.
     logic inject_write_error = 0;
-    logic last_mem_write = 0;
-    logic [31:0] last_mem_addr = 0;
 
-    assign mrsp.value = raw_mrsp.value;
+    logic last_memory_request_was_write = 0;
+    logic [31:0] last_memory_request_address = 0;
 
-    assign mrsp.error =
-        raw_mrsp.error ||
-        (
-            inject_write_error &&
-            last_mem_write &&
-            last_mem_addr == 0
-        );
+    // Секвенсор -> PE.
+    wire seq_to_pe_t seq_to_pe_command [0:P-1];
 
-    wire mqv;
-    wire mqr;
-    wire mrv;
-    wire mrr;
+    wire [P-1:0] seq_to_pe_command_valid;
+    wire [P-1:0] pe_to_seq_command_ready;
+    wire [P-1:0] pe_command_ready_ungated;
 
-    wire raw_mqr;
-    wire raw_mrv;
-    wire raw_mrr;
+    // PE -> секвенсор.
+    wire [P-1:0] pe_to_seq_layer_done;
+    wire [P-1:0] pe_to_seq_sum_valid;
+    wire [P-1:0] pe_sum_valid_for_seq;
 
-    wire seq_to_pe_t pcmd [0:P-1];
+    wire pe_status_t pe_to_seq_status [0:P-1];
 
-    wire [P-1:0] pv;
-    wire [P-1:0] pr;
-    wire [P-1:0] raw_pr;
+    // PE -> reduce.
+    wire [31:0] pe_to_reduce_sum [0:P-1];
 
-    wire [P-1:0] pdone;
-    wire [P-1:0] pov;
-    wire [P-1:0] por;
+    // Секвенсор -> RS.
+    wire [31:0] seq_to_rs_bias;
+    wire seq_to_rs_start;
+    wire rs_to_seq_start_ready;
+    wire rs_start_ready_ungated;
 
-    wire pe_status_t pstatus [0:P-1];
-    wire pe_to_rs_t pout [0:P-1];
+    // RS -> секвенсор.
+    wire [31:0] rs_to_seq_result_data;
+    wire rs_status_t rs_to_seq_result_status;
 
-    wire seq_to_rs_t rcmd;
-    wire rs_to_seq_t rresult;
+    wire rs_to_seq_result_valid;
+    wire seq_to_rs_result_ready;
+    wire rs_result_valid_ungated;
 
-    wire rs_start;
-    wire rs_ready;
-    wire rs_valid;
-    wire rs_accept;
-
-    wire raw_rs_ready;
-    wire raw_rs_valid;
-
-    wire compute_reset;
+    wire compute_rst_n;
     wire model_valid;
-    wire busy;
+    wire sequencer_busy;
 
-    integer cycle = 0;
-    integer sequence_id = 0;
-    integer responses = 0;
+    integer cycle_count = 0;
+    integer request_sequence = 0;
+    integer checked_response_count = 0;
 
-    logic held = 0;
+    logic [31:0] original_model_words [0:662];
+    logic [31:0] model_image_words [0:662];
+    logic [31:0] input_vector_words [0:48];
+    logic [31:0] expected_output_words [0:14];
 
-    logic [31:0] base_model [0:662];
-    logic [31:0] model [0:662];
-    logic [31:0] inputs [0:48];
-    logic [31:0] golden [0:14];
+    logic [31:0] model_crc_work;
 
-    logic [31:0] crc_temp;
+    logic inference_in_progress = 0;
+    logic result_write_pending = 0;
 
-    logic run_active = 0;
-    logic activation_pending = 0;
-
-    integer rs_count = 0;
+    integer accepted_neuron_result_count = 0;
 
     // Искусственные задержки интерфейсов.
-    wire mem_gate = (cycle % 5 != 1);
-    wire rsp_gate = (cycle % 7 != 2);
-    wire rs_gate = (cycle % 4 != 1);
-    wire rs_out_gate = (cycle % 6 != 3);
+    wire memory_request_path_enabled =
+        (cycle_count % 5 != 1);
+
+    wire memory_response_path_enabled =
+        (cycle_count % 7 != 2);
+
+    wire rs_start_path_enabled =
+        (cycle_count % 4 != 1);
+
+    wire rs_result_path_enabled =
+        (cycle_count % 6 != 3);
+
+    // Дополнительно задерживаем видимость готовности сумм.
+    // Секвенсор обязан ждать, даже если layer_done уже установлен.
+    wire sum_visibility_enabled =
+        (cycle_count % 7 != 5);
+
+    assign pe_sum_valid_for_seq =
+        pe_to_seq_sum_valid & {P{sum_visibility_enabled}};
+
+    assign shared_mem_to_seq_response.value =
+        memory_response_ungated.value;
+
+    assign shared_mem_to_seq_response.error =
+        memory_response_ungated.error ||
+        (
+            inject_write_error &&
+            last_memory_request_was_write &&
+            last_memory_request_address == 0
+        );
 
     sequencer #(
         .N_PE(P)
     ) dut (
         .clk_i(clk),
-        .rst_n_i(rst),
+        .rst_n_i(rst_n),
 
-        .io_to_seq_data_i(host_data),
-        .io_to_seq_valid_i(host_valid),
-        .io_to_seq_ready_o(host_ready),
+        .io_to_seq_data_i(io_to_seq_request),
+        .io_to_seq_valid_i(io_to_seq_request_valid),
+        .io_to_seq_ready_o(seq_to_io_request_ready),
 
-        .seq_to_io_data_o(response),
-        .seq_to_io_valid_o(reply_valid),
-        .seq_to_io_ready_i(reply_ready),
+        .seq_to_io_data_o(seq_to_io_response),
+        .seq_to_io_valid_o(seq_to_io_response_valid),
+        .seq_to_io_ready_i(io_to_seq_response_ready),
 
-        .seq_to_mem_data_o(mreq),
-        .seq_to_mem_valid_o(mqv),
-        .seq_to_mem_ready_i(mqr),
+        .seq_to_mem_data_o(seq_to_shared_mem_request),
+        .seq_to_mem_valid_o(seq_to_shared_mem_request_valid),
+        .seq_to_mem_ready_i(shared_mem_to_seq_request_ready),
 
-        .mem_to_seq_data_i(mrsp),
-        .mem_to_seq_valid_i(mrv),
-        .mem_to_seq_ready_o(mrr),
+        .mem_to_seq_data_i(shared_mem_to_seq_response),
+        .mem_to_seq_valid_i(shared_mem_to_seq_response_valid),
+        .mem_to_seq_ready_o(seq_to_shared_mem_response_ready),
 
-        .seq_to_pe_data_o(pcmd),
-        .seq_to_pe_valid_o(pv),
-        .seq_to_pe_ready_i(pr),
+        .seq_to_pe_command_o(seq_to_pe_command),
+        .seq_to_pe_command_valid_o(seq_to_pe_command_valid),
+        .pe_to_seq_command_ready_i(pe_to_seq_command_ready),
 
-        .pe_done_i(pdone),
-        .pe_status_i(pstatus),
+        .pe_to_seq_layer_done_i(pe_to_seq_layer_done),
+        .pe_to_seq_sum_valid_i(pe_sum_valid_for_seq),
+        .pe_to_seq_status_i(pe_to_seq_status),
 
-        .seq_to_rs_data_o(rcmd),
-        .seq_to_rs_start_o(rs_start),
-        .seq_to_rs_ready_i(rs_ready),
+        .seq_to_rs_bias_o(seq_to_rs_bias),
+        .seq_to_rs_start_o(seq_to_rs_start),
+        .rs_to_seq_start_ready_i(rs_to_seq_start_ready),
 
-        .rs_to_seq_data_i(rresult),
-        .rs_to_seq_valid_i(rs_valid),
-        .rs_to_seq_ready_o(rs_accept),
+        .rs_to_seq_result_data_i(rs_to_seq_result_data),
+        .rs_to_seq_result_status_i(rs_to_seq_result_status),
+        .rs_to_seq_result_valid_i(rs_to_seq_result_valid),
+        .seq_to_rs_result_ready_o(seq_to_rs_result_ready),
 
-        .compute_rst_n_o(compute_reset),
+        .compute_rst_n_o(compute_rst_n),
         .model_valid_o(model_valid),
-        .busy_o(busy)
+        .busy_o(sequencer_busy)
     );
 
-    assign mqr = raw_mqr && mem_gate;
-    assign mrv = raw_mrv && rsp_gate;
-    assign raw_mrr = mrr && rsp_gate;
+    // Обе стороны handshake должны видеть одинаковую задержку.
+    assign shared_mem_to_seq_request_ready =
+        memory_request_ready_ungated &&
+        memory_request_path_enabled;
+
+    assign shared_mem_to_seq_response_valid =
+        memory_response_valid_ungated &&
+        memory_response_path_enabled;
+
+    assign memory_response_ready_gated =
+        seq_to_shared_mem_response_ready &&
+        memory_response_path_enabled;
 
     memory #(
         .MEM_WORDS(4096)
     ) shared_memory (
         .clk_i(clk),
-        .rst_n_i(rst),
+        .rst_n_i(rst_n),
 
-        .a_req_data_i(mreq),
-        .a_req_valid_i(mqv && mem_gate),
-        .a_req_ready_o(raw_mqr),
+        .a_client_to_mem_request_data_i(
+            seq_to_shared_mem_request
+        ),
+        .a_client_to_mem_request_valid_i(
+            seq_to_shared_mem_request_valid &&
+            memory_request_path_enabled
+        ),
+        .a_mem_to_client_request_ready_o(
+            memory_request_ready_ungated
+        ),
 
-        .a_rsp_data_o(raw_mrsp),
-        .a_rsp_valid_o(raw_mrv),
-        .a_rsp_ready_i(raw_mrr),
+        .a_mem_to_client_response_data_o(
+            memory_response_ungated
+        ),
+        .a_mem_to_client_response_valid_o(
+            memory_response_valid_ungated
+        ),
+        .a_client_to_mem_response_ready_i(
+            memory_response_ready_gated
+        ),
 
-        .b_req_data_i('0),
-        .b_req_valid_i(1'b0),
-        .b_req_ready_o(),
+        .b_client_to_mem_request_data_i('0),
+        .b_client_to_mem_request_valid_i(1'b0),
+        .b_mem_to_client_request_ready_o(),
 
-        .b_rsp_data_o(),
-        .b_rsp_valid_o(),
-        .b_rsp_ready_i(1'b1)
+        .b_mem_to_client_response_data_o(),
+        .b_mem_to_client_response_valid_o(),
+        .b_client_to_mem_response_ready_i(1'b1)
     );
 
     for (genvar p = 0; p < P; p++) begin : g_pe
 
-        wire gate = ((cycle+p) % 4 != 0);
+        wire pe_command_path_enabled =
+            ((cycle_count + p) % 4 != 0);
 
-        assign pr[p] = raw_pr[p] && gate;
+        assign pe_to_seq_command_ready[p] =
+            pe_command_ready_ungated[p] &&
+            pe_command_path_enabled;
 
         pe u_pe (
             .clk_i(clk),
-            .rst_n_i(compute_reset),
+            .rst_n_i(compute_rst_n),
 
-            .seq_to_pe_data_i(pcmd[p]),
-            .seq_to_pe_valid_i(pv[p] && gate),
-            .seq_to_pe_ready_o(raw_pr[p]),
+            .seq_to_pe_command_i(seq_to_pe_command[p]),
+            .seq_to_pe_command_valid_i(
+                seq_to_pe_command_valid[p] &&
+                pe_command_path_enabled
+            ),
+            .pe_to_seq_command_ready_o(
+                pe_command_ready_ungated[p]
+            ),
 
-            .pe_to_reduce_data_o(pout[p]),
-            .pe_to_reduce_valid_o(pov[p]),
-            .pe_to_reduce_ready_i(por[p]),
+            .pe_to_reduce_sum_o(pe_to_reduce_sum[p]),
+            .pe_to_seq_sum_valid_o(pe_to_seq_sum_valid[p]),
 
-            .pe_done_o(pdone[p]),
-            .pe_status_o(pstatus[p])
+            .pe_to_seq_layer_done_o(pe_to_seq_layer_done[p]),
+            .pe_to_seq_status_o(pe_to_seq_status[p])
         );
 
-        wire seq_to_pe_t observed_cmd = pcmd[p];
+        wire seq_to_pe_t observed_pe_command;
+        assign observed_pe_command = seq_to_pe_command[p];
 
         always @(posedge clk) begin
             if (
-                rst &&
-                pv[p] &&
-                pr[p] &&
-                observed_cmd.op == PE_NEXT &&
-                activation_pending
+                rst_n &&
+                seq_to_pe_command_valid[p] &&
+                pe_to_seq_command_ready[p] &&
+                observed_pe_command.op == PE_NEXT &&
+                result_write_pending
             )
                 $fatal(
                     1,
@@ -213,76 +272,133 @@ module tb_sequencer #(
 
     end
 
-    assign rs_ready = raw_rs_ready && rs_gate;
-    assign rs_valid = raw_rs_valid && rs_out_gate;
+    assign rs_to_seq_start_ready =
+        rs_start_ready_ungated &&
+        rs_start_path_enabled;
+
+    assign rs_to_seq_result_valid =
+        rs_result_valid_ungated &&
+        rs_result_path_enabled;
 
     reduce_sigmoid #(
         .N_PE(P)
     ) rs (
         .clk_i(clk),
-        .rst_n_i(compute_reset),
+        .rst_n_i(compute_rst_n),
 
-        .seq_to_rs_data_i(rcmd),
-        .seq_to_rs_start_i(rs_start && rs_gate),
-        .seq_to_rs_ready_o(raw_rs_ready),
+        .pe_sums_i(pe_to_reduce_sum),
 
-        .pe_to_rs_data_i(pout),
-        .pe_to_rs_valid_i(pov),
-        .pe_to_rs_ready_o(por),
+        .seq_bias_i(seq_to_rs_bias),
+        .seq_start_i(
+            seq_to_rs_start && rs_start_path_enabled
+        ),
+        .seq_start_ready_o(rs_start_ready_ungated),
 
-        .rs_to_seq_data_o(rresult),
-        .rs_to_seq_valid_o(raw_rs_valid),
-        .rs_to_seq_ready_i(rs_accept && rs_out_gate)
+        .seq_result_data_o(rs_to_seq_result_data),
+        .seq_result_status_o(rs_to_seq_result_status),
+        .seq_result_valid_o(rs_result_valid_ungated),
+        .seq_result_ready_i(
+            seq_to_rs_result_ready &&
+            rs_result_path_enabled
+        )
     );
 
+    // Проверки протоколов и порядка выполнения.
     always @(posedge clk) begin
-        cycle <= cycle + 1;
+        cycle_count <= cycle_count + 1;
 
-        if (!rst) begin
-            held <= 0;
+        if (!rst_n) begin
+            io_response_stalled_reg <= 0;
         end else begin
 
             if (
-                held &&
-                (!reply_valid || response !== held_response)
+                io_response_stalled_reg &&
+                (
+                    !seq_to_io_response_valid ||
+                    seq_to_io_response !== held_io_response
+                )
             )
                 $fatal(1, "Response changed while stalled");
 
-            held <= reply_valid && !reply_ready;
-            held_response <= response;
+            io_response_stalled_reg <=
+                seq_to_io_response_valid &&
+                !io_to_seq_response_ready;
 
-            if (rs_start && rs_ready && !(&pdone))
+            held_io_response <= seq_to_io_response;
+
+            if (
+                seq_to_rs_start &&
+                rs_to_seq_start_ready &&
+                !(&pe_to_seq_layer_done)
+            )
                 $fatal(1, "Reduction before PE barrier");
 
-            if (run_active && rs_valid && rs_accept) begin
-                activation_pending <= 1;
-                rs_count <= rs_count + 1;
-            end
+            if (
+                seq_to_rs_start &&
+                !(&pe_sum_valid_for_seq)
+            )
+                $fatal(
+                    1,
+                    "RS start before all current sums are valid"
+                );
 
-            if (mqv && mqr) begin
-                last_mem_write <= mreq.write;
-                last_mem_addr <= mreq.addr;
+            if (
+                inference_in_progress &&
+                rs_to_seq_result_valid &&
+                seq_to_rs_result_ready
+            ) begin
+                result_write_pending <= 1;
+                accepted_neuron_result_count <=
+                    accepted_neuron_result_count + 1;
             end
 
             if (
-                mrv &&
-                mrr &&
-                last_mem_write &&
-                activation_pending &&
+                seq_to_shared_mem_request_valid &&
+                shared_mem_to_seq_request_ready
+            ) begin
+                last_memory_request_was_write <=
+                    seq_to_shared_mem_request.write;
+
+                last_memory_request_address <=
+                    seq_to_shared_mem_request.addr;
+            end
+
+            if (
+                shared_mem_to_seq_response_valid &&
+                seq_to_shared_mem_response_ready &&
+                last_memory_request_was_write &&
+                result_write_pending &&
                 (
                     (
-                        last_mem_addr >= 32'h3000 &&
-                        last_mem_addr < 32'h30C4
+                        last_memory_request_address >= 32'h3000 &&
+                        last_memory_request_address < 32'h30C4
                     ) ||
                     (
-                        last_mem_addr >= 32'h3100 &&
-                        last_mem_addr < 32'h3130
+                        last_memory_request_address >= 32'h3100 &&
+                        last_memory_request_address < 32'h3130
                     )
                 )
             )
-                activation_pending <= 0;
+                result_write_pending <= 0;
         end
     end
+
+    task automatic require_file(
+        input string filename
+    );
+        integer fd;
+
+        fd = $fopen(filename, "r");
+
+        if (fd == 0)
+            $fatal(
+                1,
+                "Cannot open %s in simulator working directory",
+                filename
+            );
+
+        $fclose(fd);
+    endtask
 
     function automatic logic [31:0] crc_byte(
         input logic [31:0] c0,
@@ -299,98 +415,108 @@ module tb_sequencer #(
         return c;
     endfunction
 
-    task automatic restore_model;
+    task automatic restore_model_image;
         for (int i = 0; i < 663; i++)
-            model[i] = base_model[i];
+            model_image_words[i] = original_model_words[i];
     endtask
 
-    task automatic update_crc;
-        crc_temp = 32'hFFFFFFFF;
-        model[6] = 0;
+    task automatic update_model_crc;
+        model_crc_work = 32'hFFFFFFFF;
+        model_image_words[6] = 0;
 
-        for (int i = 0; i < int'(model[5] >> 2); i++) begin
+        for (
+            int i = 0;
+            i < int'(model_image_words[5] >> 2);
+            i++
+        ) begin
             for (int b = 0; b < 4; b++)
-                crc_temp = crc_byte(
-                    crc_temp,
-                    model[i][8*b +: 8]
+                model_crc_work = crc_byte(
+                    model_crc_work,
+                    model_image_words[i][8*b +: 8]
                 );
         end
 
-        model[6] = crc_temp ^ 32'hFFFFFFFF;
+        model_image_words[6] =
+            model_crc_work ^ 32'hFFFFFFFF;
     endtask
 
-    task automatic send_word(input io_to_seq_t d);
+    task automatic send_io_transfer(
+        input io_to_seq_t d
+    );
         @(negedge clk);
 
-        host_data = d;
-        host_valid = 1;
+        io_to_seq_request = d;
+        io_to_seq_request_valid = 1;
 
         do @(posedge clk);
-        while (!host_ready);
+        while (!seq_to_io_request_ready);
 
         @(negedge clk);
-        host_valid = 0;
+        io_to_seq_request_valid = 0;
     endtask
 
-    task automatic header(
+    task automatic send_command_header(
         input logic [7:0] cmd,
         input logic [31:0] arg,
         input logic [15:0] len
     );
         io_to_seq_t d;
 
-        sequence_id = sequence_id + 1;
+        request_sequence = request_sequence + 1;
 
         d = '0;
         d.is_header = 1;
-        d.seq = 16'(sequence_id);
+        d.seq = 16'(request_sequence);
         d.cmd = cmd;
 
-        if (cmd == CMD_CONFIG_BEGIN || cmd == CMD_INPUT_BEGIN)
+        if (
+            cmd == CMD_CONFIG_BEGIN ||
+            cmd == CMD_INPUT_BEGIN
+        )
             d.image_size = arg;
         else
             d.offset = arg;
 
         d.data_length = len;
 
-        send_word(d);
+        send_io_transfer(d);
     endtask
 
-    task automatic expect_reply(
+    task automatic expect_io_response(
         input logic [7:0] status,
         input logic [31:0] value
     );
-        wait (reply_valid);
+        wait (seq_to_io_response_valid);
         @(negedge clk);
 
         if (
-            response.seq !== 16'(sequence_id) ||
-            response.status !== status ||
-            response.next_offset !== value
+            seq_to_io_response.seq !== 16'(request_sequence) ||
+            seq_to_io_response.status !== status ||
+            seq_to_io_response.next_offset !== value
         ) begin
             $fatal(
                 1,
                 "Reply seq%0d: status=%h expected=%h arg=%h expected=%h state=%0d",
-                sequence_id,
-                response.status,
+                request_sequence,
+                seq_to_io_response.status,
                 status,
-                response.next_offset,
+                seq_to_io_response.next_offset,
                 value,
                 dut.state
             );
         end
 
-        // Ответ должен оставаться неизменным до ready.
+        // Получатель намеренно задерживает ready.
         repeat (5) @(negedge clk);
 
-        reply_ready = 1;
+        io_to_seq_response_ready = 1;
         @(negedge clk);
 
-        reply_ready = 0;
-        responses = responses + 1;
+        io_to_seq_response_ready = 0;
+        checked_response_count = checked_response_count + 1;
     endtask
 
-    task automatic chunk(
+    task automatic send_data_chunk(
         input logic [7:0] cmd,
         input integer offset,
         input integer words,
@@ -398,273 +524,327 @@ module tb_sequencer #(
     );
         io_to_seq_t d;
 
-        header(cmd, 32'(offset), 16'(words*4));
+        send_command_header(
+            cmd,
+            32'(offset),
+            16'(words*4)
+        );
 
         for (int i = 0; i < words; i++) begin
             d = '0;
 
             d.word = from_input
-                ? inputs[offset/4+i]
-                : model[offset/4+i];
+                ? input_vector_words[offset/4+i]
+                : model_image_words[offset/4+i];
 
             d.keep = 4'hF;
             d.last = (i == words-1);
 
-            send_word(d);
+            send_io_transfer(d);
         end
     endtask
 
-    task automatic upload(input logic [7:0] status);
-        header(CMD_CONFIG_BEGIN, model[5], 0);
-        expect_reply(STATUS_OK, 0);
+    task automatic upload_model(
+        input logic [7:0] status
+    );
+        send_command_header(
+            CMD_CONFIG_BEGIN,
+            model_image_words[5],
+            0
+        );
+
+        expect_io_response(STATUS_OK, 0);
 
         for (
             int offset = 0;
-            offset < int'(model[5] >> 2);
+            offset < int'(model_image_words[5] >> 2);
             offset += 64
         ) begin
-            chunk(
+            send_data_chunk(
                 CMD_CONFIG_DATA,
                 offset*4,
-                (int'(model[5] >> 2)-offset < 64)
-                    ? int'(model[5] >> 2)-offset
+                (int'(model_image_words[5] >> 2)-offset < 64)
+                    ? int'(model_image_words[5] >> 2)-offset
                     : 64,
                 0
             );
 
-            expect_reply(
+            expect_io_response(
                 STATUS_OK,
                 32'(
                     (
-                        (offset+64 < int'(model[5] >> 2))
+                        (offset+64 < int'(model_image_words[5] >> 2))
                             ? offset+64
-                            : int'(model[5] >> 2)
+                            : int'(model_image_words[5] >> 2)
                     ) * 4
                 )
             );
         end
 
-        header(CMD_CONFIG_END, 0, 0);
+        send_command_header(CMD_CONFIG_END, 0, 0);
 
-        expect_reply(
-            status,
-            (status == STATUS_OK) ? model[5] : 0
-        );
-    endtask
-
-    task automatic input_upload(input logic [7:0] status);
-        header(
-            CMD_INPUT_BEGIN,
-            {16'd0, model[2][15:0]} << 2,
-            0
-        );
-
-        expect_reply(STATUS_OK, 0);
-
-        chunk(
-            CMD_INPUT_DATA,
-            0,
-            int'(model[2][15:0]),
-            1
-        );
-
-        expect_reply(
-            STATUS_OK,
-            {16'd0, model[2][15:0]} << 2
-        );
-
-        header(CMD_INPUT_END, 0, 0);
-
-        expect_reply(
+        expect_io_response(
             status,
             (status == STATUS_OK)
-                ? ({16'd0, model[2][15:0]} << 2)
+                ? model_image_words[5]
                 : 0
         );
     endtask
 
-    task automatic infer_and_check;
-        run_active = 1;
-        rs_count = 0;
+    task automatic upload_input_vector(
+        input logic [7:0] status
+    );
+        send_command_header(
+            CMD_INPUT_BEGIN,
+            {16'd0, model_image_words[2][15:0]} << 2,
+            0
+        );
 
-        header(CMD_RUN, 0, 0);
-        expect_reply(STATUS_OK, 32'h3000);
+        expect_io_response(STATUS_OK, 0);
 
-        run_active = 0;
+        send_data_chunk(
+            CMD_INPUT_DATA,
+            0,
+            int'(model_image_words[2][15:0]),
+            1
+        );
 
-        if (rs_count != 15)
+        expect_io_response(
+            STATUS_OK,
+            {16'd0, model_image_words[2][15:0]} << 2
+        );
+
+        send_command_header(CMD_INPUT_END, 0, 0);
+
+        expect_io_response(
+            status,
+            (status == STATUS_OK)
+                ? ({16'd0, model_image_words[2][15:0]} << 2)
+                : 0
+        );
+    endtask
+
+    task automatic run_and_check_network;
+        inference_in_progress = 1;
+        accepted_neuron_result_count = 0;
+
+        send_command_header(CMD_RUN, 0, 0);
+        expect_io_response(STATUS_OK, 32'h3000);
+
+        inference_in_progress = 0;
+
+        if (accepted_neuron_result_count != 15)
             $fatal(
                 1,
                 "Wrong number of neuron iterations: %0d",
-                rs_count
+                accepted_neuron_result_count
             );
 
-        // Промежуточный слой: 12 нейронов.
         for (int i = 0; i < 12; i++) begin
-            header(CMD_READ_WORD, 32'h3100 + 32'(4*i), 0);
-            expect_reply(STATUS_OK, golden[i]);
+            send_command_header(
+                CMD_READ_WORD,
+                32'h3100 + 32'(4*i),
+                0
+            );
+
+            expect_io_response(
+                STATUS_OK,
+                expected_output_words[i]
+            );
         end
 
-        // Последний слой: 3 нейрона.
         for (int i = 0; i < 3; i++) begin
-            header(CMD_READ_WORD, 32'h3000 + 32'(4*i), 0);
-            expect_reply(STATUS_OK, golden[12+i]);
+            send_command_header(
+                CMD_READ_WORD,
+                32'h3000 + 32'(4*i),
+                0
+            );
+
+            expect_io_response(
+                STATUS_OK,
+                expected_output_words[12+i]
+            );
         end
 
-        // Служебная запись.
-        header(CMD_READ_WORD, 32'h3200, 0);
-        expect_reply(STATUS_OK, 1);
+        send_command_header(CMD_READ_WORD, 32'h3200, 0);
+        expect_io_response(STATUS_OK, 1);
 
-        header(CMD_READ_WORD, 32'h3204, 0);
-        expect_reply(STATUS_OK, 3);
+        send_command_header(CMD_READ_WORD, 32'h3204, 0);
+        expect_io_response(STATUS_OK, 3);
 
-        header(CMD_READ_WORD, 32'h3208, 0);
-        expect_reply(STATUS_OK, 32'h3000);
+        send_command_header(CMD_READ_WORD, 32'h3208, 0);
+        expect_io_response(STATUS_OK, 32'h3000);
 
-        header(CMD_READ_WORD, 32'h320C, 0);
-        expect_reply(STATUS_OK, 0);
+        send_command_header(CMD_READ_WORD, 32'h320C, 0);
+        expect_io_response(STATUS_OK, 0);
     endtask
 
     initial begin
         io_to_seq_t malformed;
 
-        host_data = '0;
+        io_to_seq_request = '0;
 
-        $readmemh("test_model.mem", base_model);
-        $readmemh("test_input.mem", inputs);
+        require_file("test_model.mem");
+        require_file("test_input.mem");
+        require_file($sformatf("test_expected_p%0d.mem", P));
+        require_file("sigmoid_lut.mem");
+
+        $readmemh(
+            "test_model.mem",
+            original_model_words
+        );
+
+        $readmemh(
+            "test_input.mem",
+            input_vector_words
+        );
 
         $readmemh(
             $sformatf("test_expected_p%0d.mem", P),
-            golden
+            expected_output_words
         );
 
+        for (int i = 0; i < 663; i++)
+            if ((^original_model_words[i]) === 1'bx)
+                $fatal(1, "Missing model word %0d", i);
+
+        for (int i = 0; i < 49; i++)
+            if ((^input_vector_words[i]) === 1'bx)
+                $fatal(1, "Missing input word %0d", i);
+
+        for (int i = 0; i < 15; i++)
+            if ((^expected_output_words[i]) === 1'bx)
+                $fatal(1, "Missing expected word %0d", i);
+
         repeat (5) @(negedge clk);
-        rst = 1;
+        rst_n = 1;
 
-        // RUN до загрузки модели запрещён.
-        header(CMD_RUN, 0, 0);
-        expect_reply(STATUS_BAD_STATE, 0);
+        // RUN до загрузки модели.
+        send_command_header(CMD_RUN, 0, 0);
+        expect_io_response(STATUS_BAD_STATE, 0);
 
-        header(CMD_CONFIG_BEGIN, 31, 0);
-        expect_reply(STATUS_BAD_SIZE, 0);
+        send_command_header(CMD_CONFIG_BEGIN, 31, 0);
+        expect_io_response(STATUS_BAD_SIZE, 0);
 
-        restore_model();
+        restore_model_image();
 
-        // DATA до BEGIN запрещён.
-        chunk(CMD_CONFIG_DATA, 0, 2, 0);
-        expect_reply(STATUS_BAD_STATE, 0);
+        // DATA до CONFIG_BEGIN.
+        send_data_chunk(CMD_CONFIG_DATA, 0, 2, 0);
+        expect_io_response(STATUS_BAD_STATE, 0);
 
-        header(CMD_CONFIG_BEGIN, 2652, 0);
-        expect_reply(STATUS_OK, 0);
+        send_command_header(CMD_CONFIG_BEGIN, 2652, 0);
+        expect_io_response(STATUS_OK, 0);
 
         // Неверное смещение.
-        chunk(CMD_CONFIG_DATA, 4, 1, 0);
-        expect_reply(STATUS_BAD_OFFSET, 0);
+        send_data_chunk(CMD_CONFIG_DATA, 4, 1, 0);
+        expect_io_response(STATUS_BAD_OFFSET, 0);
 
-        // Некорректный keep.
-        header(CMD_CONFIG_DATA, 0, 8);
+        // Неполная маска keep.
+        send_command_header(CMD_CONFIG_DATA, 0, 8);
 
         malformed = '0;
-        malformed.word = model[0];
+        malformed.word = model_image_words[0];
         malformed.keep = 3;
-        send_word(malformed);
+        send_io_transfer(malformed);
 
-        malformed.word = model[1];
+        malformed.word = model_image_words[1];
         malformed.keep = 15;
         malformed.last = 1;
-        send_word(malformed);
+        send_io_transfer(malformed);
 
-        expect_reply(STATUS_BAD_STREAM, 0);
+        expect_io_response(STATUS_BAD_STREAM, 0);
 
-        // Ошибка записи памяти: остаток пакета нужно дочитать.
+        // Ошибка памяти и дочитывание остатка пакета.
         inject_write_error = 1;
 
-        chunk(CMD_CONFIG_DATA, 0, 4, 0);
-        expect_reply(STATUS_MEMORY_ERROR, 0);
+        send_data_chunk(CMD_CONFIG_DATA, 0, 4, 0);
+        expect_io_response(STATUS_MEMORY_ERROR, 0);
 
         inject_write_error = 0;
 
-        // Повторная передача с того же смещения.
-        chunk(CMD_CONFIG_DATA, 0, 2, 0);
-        expect_reply(STATUS_OK, 8);
+        send_data_chunk(CMD_CONFIG_DATA, 0, 2, 0);
+        expect_io_response(STATUS_OK, 8);
 
-        // Образ ещё загружен не полностью.
-        header(CMD_CONFIG_END, 0, 0);
-        expect_reply(STATUS_BAD_STATE, 8);
+        // Образ ещё не загружен полностью.
+        send_command_header(CMD_CONFIG_END, 0, 0);
+        expect_io_response(STATUS_BAD_STATE, 8);
 
         $display(
             "PASS chunk state/offset/stream checks and memory-error payload drain"
         );
 
-        // Неверный CRC всего образа.
-        restore_model();
-        model[100] = model[100] ^ 1;
+        // Ошибка CRC всего образа.
+        restore_model_image();
+        model_image_words[100] = model_image_words[100] ^ 1;
 
-        upload(STATUS_MODEL_CRC);
+        upload_model(STATUS_MODEL_CRC);
 
         if (model_valid)
             $fatal(1, "Bad CRC became valid");
 
         $display("PASS CRC failure and invalid initial state");
 
-        // Неверный дескриптор с корректным CRC.
-        restore_model();
-        model[10] = 32'h3000;
-        update_crc();
+        // Ошибка дескриптора при правильном CRC.
+        restore_model_image();
+        model_image_words[10] = 32'h3000;
+        update_model_crc();
 
-        upload(STATUS_BAD_MODEL);
+        upload_model(STATUS_BAD_MODEL);
 
         if (model_valid)
             $fatal(1, "Bad descriptor became valid");
 
         // Корректная модель.
-        restore_model();
-        upload(STATUS_OK);
+        restore_model_image();
+        upload_model(STATUS_OK);
 
         if (!model_valid)
             $fatal(1, "Model not ready");
 
-        $display("PASS full model validation and weight distribution");
+        $display(
+            "PASS full model validation and weight distribution"
+        );
 
         // Неверный размер входного вектора.
-        header(CMD_INPUT_BEGIN, 192, 0);
-        expect_reply(STATUS_BAD_SIZE, 0);
+        send_command_header(CMD_INPUT_BEGIN, 192, 0);
+        expect_io_response(STATUS_BAD_SIZE, 0);
 
         // NaN во входном векторе.
-        inputs[0] = 32'h7FC00000;
-        input_upload(STATUS_BAD_STREAM);
+        input_vector_words[0] = 32'h7FC00000;
+        upload_input_vector(STATUS_BAD_STREAM);
 
         // Первый успешный запуск.
-        $readmemh("test_input.mem", inputs);
-        input_upload(STATUS_OK);
-        infer_and_check();
+        $readmemh("test_input.mem", input_vector_words);
+        upload_input_vector(STATUS_OK);
+        run_and_check_network();
 
-        // Перед следующим RUN нужен новый входной вектор.
-        header(CMD_RUN, 0, 0);
-        expect_reply(STATUS_BAD_STATE, 0);
+        // Повтор RUN без нового входа запрещён.
+        send_command_header(CMD_RUN, 0, 0);
+        expect_io_response(STATUS_BAD_STATE, 0);
 
-        header(CMD_READ_WORD, 1, 0);
-        expect_reply(STATUS_BAD_OFFSET, 0);
+        send_command_header(CMD_READ_WORD, 1, 0);
+        expect_io_response(STATUS_BAD_OFFSET, 0);
 
-        // Второй успешный запуск без перезагрузки весов.
-        input_upload(STATUS_OK);
-        infer_and_check();
+        // Второй запуск без повторной загрузки весов.
+        upload_input_vector(STATUS_OK);
+        run_and_check_network();
 
         $display(
             "PASS two full inferences, argmax and memory/PE/RS/IO backpressure"
         );
 
-        // Переполнение в PE.
-        restore_model();
-        model[24] = 32'h7F7FFFFF;
-        update_crc();
-        upload(STATUS_OK);
+        // Переполнение арифметики PE.
+        restore_model_image();
+        model_image_words[24] = 32'h7F7FFFFF;
 
-        inputs[0] = 32'h40000000;
-        input_upload(STATUS_OK);
+        update_model_crc();
+        upload_model(STATUS_OK);
 
-        header(CMD_RUN, 0, 0);
-        expect_reply(STATUS_PE_ERROR, 0);
+        input_vector_words[0] = 32'h40000000;
+        upload_input_vector(STATUS_OK);
+
+        send_command_header(CMD_RUN, 0, 0);
+        expect_io_response(STATUS_PE_ERROR, 0);
 
         if (!model_valid)
             $fatal(
@@ -672,111 +852,120 @@ module tb_sequencer #(
                 "Runtime failure discarded verified model"
             );
 
-        header(CMD_READ_WORD, 32'h3000, 0);
-        expect_reply(STATUS_BAD_STATE, 0);
+        send_command_header(CMD_READ_WORD, 32'h3000, 0);
+        expect_io_response(STATUS_BAD_STATE, 0);
 
-        // Переполнение reduce при конечных частичных суммах.
-        model[612] = 32'h7F7FFFFF;
-        update_crc();
-        upload(STATUS_OK);
+        // Переполнение reduce после конечных сумм PE.
+        model_image_words[612] = 32'h7F7FFFFF;
+
+        update_model_crc();
+        upload_model(STATUS_OK);
 
         for (int i = 0; i < 49; i++)
-            inputs[i] = 0;
+            input_vector_words[i] = 0;
 
-        inputs[0] = 32'h3F800000;
-        input_upload(STATUS_OK);
+        input_vector_words[0] = 32'h3F800000;
+        upload_input_vector(STATUS_OK);
 
-        header(CMD_RUN, 0, 0);
-        expect_reply(STATUS_COMPUTE_ERROR, 0);
+        send_command_header(CMD_RUN, 0, 0);
+        expect_io_response(STATUS_COMPUTE_ERROR, 0);
 
         // Восстановление после ошибок.
-        restore_model();
-        upload(STATUS_OK);
+        restore_model_image();
+        upload_model(STATUS_OK);
 
-        $readmemh("test_input.mem", inputs);
-        input_upload(STATUS_OK);
-        infer_and_check();
+        $readmemh("test_input.mem", input_vector_words);
+        upload_input_vector(STATUS_OK);
+        run_and_check_network();
 
-        // Модель с одним слоем 49 -> 12.
-        restore_model();
+        // Модель с одним слоем: 49 -> 12.
+        restore_model_image();
 
-        model[1] = 32'h00010001;
-        model[2] = 32'h000C0031;
+        model_image_words[1] = 32'h00010001;
+        model_image_words[2] = 32'h000C0031;
 
-        update_crc();
-        upload(STATUS_OK);
-        input_upload(STATUS_OK);
+        update_model_crc();
+        upload_model(STATUS_OK);
+        upload_input_vector(STATUS_OK);
 
-        run_active = 1;
-        rs_count = 0;
+        inference_in_progress = 1;
+        accepted_neuron_result_count = 0;
 
-        header(CMD_RUN, 0, 0);
-        expect_reply(STATUS_OK, 32'h3100);
+        send_command_header(CMD_RUN, 0, 0);
+        expect_io_response(STATUS_OK, 32'h3100);
 
-        run_active = 0;
+        inference_in_progress = 0;
 
-        if (rs_count != 12)
+        if (accepted_neuron_result_count != 12)
             $fatal(1, "Single-layer iteration count");
 
         for (int i = 0; i < 12; i++) begin
-            header(CMD_READ_WORD, 32'h3100 + 32'(4*i), 0);
-            expect_reply(STATUS_OK, golden[i]);
+            send_command_header(
+                CMD_READ_WORD,
+                32'h3100 + 32'(4*i),
+                0
+            );
+
+            expect_io_response(
+                STATUS_OK,
+                expected_output_words[i]
+            );
         end
 
-        // Модель из восьми слоёв 1 -> 1.
-        // Веса и bias равны нулю, результат sigmoid(0) = 0.5.
+        // Восемь слоёв 1 -> 1.
+        // Все веса и bias равны нулю.
         for (int i = 0; i < 663; i++)
-            model[i] = 0;
+            model_image_words[i] = 0;
 
-        model[0] = 32'h32504E4E;
-        model[1] = 32'h00080001;
-        model[2] = 32'h00010001;
+        model_image_words[0] = 32'h32504E4E;
+        model_image_words[1] = 32'h00080001;
+        model_image_words[2] = 32'h00010001;
 
-        model[3] = 32'h00000101;
-        model[4] = 32;
-        model[5] = 352;
+        model_image_words[3] = 32'h00000101;
+        model_image_words[4] = 32;
+        model_image_words[5] = 352;
 
         for (int l = 0; l < 8; l++) begin
-            model[8+8*l] = 32'h00010101;
-            model[9+8*l] = 32'h00010001;
+            model_image_words[8+8*l] = 32'h00010101;
+            model_image_words[9+8*l] = 32'h00010001;
 
-            model[10+8*l] = 32'(288 + 8*l);
-            model[11+8*l] = 32'(292 + 8*l);
+            model_image_words[10+8*l] = 32'(288 + 8*l);
+            model_image_words[11+8*l] = 32'(292 + 8*l);
 
-            model[12+8*l] =
+            model_image_words[12+8*l] =
                 (l % 2 == 0) ? 32'h3000 : 32'h3100;
 
-            model[13+8*l] =
+            model_image_words[13+8*l] =
                 (l % 2 == 0) ? 32'h3100 : 32'h3000;
 
-            model[14+8*l] = 4;
+            model_image_words[14+8*l] = 4;
         end
 
-        update_crc();
-        upload(STATUS_OK);
+        update_model_crc();
+        upload_model(STATUS_OK);
 
-        inputs[0] = 32'h3F800000;
-        input_upload(STATUS_OK);
+        input_vector_words[0] = 32'h3F800000;
+        upload_input_vector(STATUS_OK);
 
-        run_active = 1;
-        rs_count = 0;
+        inference_in_progress = 1;
+        accepted_neuron_result_count = 0;
 
-        header(CMD_RUN, 0, 0);
-        expect_reply(STATUS_OK, 32'h3000);
+        send_command_header(CMD_RUN, 0, 0);
+        expect_io_response(STATUS_OK, 32'h3000);
 
-        run_active = 0;
+        inference_in_progress = 0;
 
-        if (rs_count != 8)
+        if (accepted_neuron_result_count != 8)
             $fatal(1, "Maximum-layer iteration count");
 
-        header(CMD_READ_WORD, 32'h3000, 0);
-        expect_reply(STATUS_OK, 32'h3F000000);
+        send_command_header(CMD_READ_WORD, 32'h3000, 0);
+        expect_io_response(STATUS_OK, 32'h3F000000);
 
         // Девять слоёв должны быть отвергнуты.
-        model[1] = 32'h00090001;
-        update_crc();
+        model_image_words[1] = 32'h00090001;
+        update_model_crc();
 
-        upload(STATUS_BAD_MODEL);
+        upload_model(STATUS_BAD_MODEL);
 
         $display(
             "PASS single layer, eight layers, idle PEs and excessive layer rejection"
@@ -785,7 +974,7 @@ module tb_sequencer #(
         $display(
             "ALL SEQUENCER TESTS PASSED P=%0d, %0d responses",
             P,
-            responses
+            checked_response_count
         );
 
         $finish;

@@ -6,214 +6,190 @@ module reduce #(
     input logic clk_i,
     input logic rst_n_i,
 
-    input rs_types_pkg::seq_to_rs_t seq_to_reduce_data_i,
-    input  logic seq_to_reduce_start_i,
-    output logic seq_to_reduce_ready_o,
+    input logic [31:0] pe_sums_i [0:N_PE-1],
+    input logic [31:0] bias_i,
 
-    input rs_types_pkg::pe_to_rs_t
-        pe_to_reduce_data_i [0:N_PE-1],
+    input  logic start_i,
+    output logic start_ready_o,
 
-    input  logic [N_PE-1:0] pe_to_reduce_valid_i,
-    output logic [N_PE-1:0] pe_to_reduce_ready_o,
-
-    output rs_types_pkg::rs_to_seq_t reduce_to_sigmoid_data_o,
-    output logic reduce_to_sigmoid_valid_o,
-    input  logic reduce_to_sigmoid_ready_i
+    output logic [31:0] result_data_o,
+    output rs_types_pkg::rs_status_t result_status_o,
+    output logic result_valid_o,
+    input  logic result_ready_i
 );
 
     import rs_types_pkg::*;
 
     typedef enum logic [2:0] {
-        IDLE,
-        LOAD_FIRST,
-        ADD_REQ,
-        ADD_WAIT,
-        RESULT
+        WAIT_START,
+        LOAD_FIRST_SUM,
+        ISSUE_ADD,
+        WAIT_ADD_RESULT,
+        RESULT_PENDING
     } state_t;
 
     state_t state;
 
-    // По одному регистру на каждый PE.
-    logic [31:0] parts [0:N_PE-1];
+    logic [31:0] partial_sum_regs [0:N_PE-1];
 
-    logic [31:0] bias_reg;
-    logic [31:0] acc_reg;
-    logic [31:0] result_reg;
-    logic [15:0] neuron_reg;
+    logic [31:0] bias_value_reg;
+    logic [31:0] accumulator_reg;
+    logic [31:0] result_value_reg;
 
-    rs_status_t status_reg;
+    rs_status_t result_status_reg;
 
-    integer part_index;
-    logic adding_bias;
-    logic accept;
+    integer partial_sum_index;
 
-    wire [N_PE-1:0] id_matches;
+    logic adding_bias_phase;
+    logic start_accepted;
+
     wire [N_PE-1:0] finite_parts;
 
-    // Пауза после снятия сброса для арифметического IP.
-    logic [2:0] reset_guard;
+    logic [2:0] reset_release_pipe;
+
+    logic [31:0] add_b;
+    logic [31:0] add_result;
+
+    logic add_request_valid;
+    logic add_result_valid;
 
     always_ff @(posedge clk_i or negedge rst_n_i) begin
         if (!rst_n_i)
-            reset_guard <= 0;
+            reset_release_pipe <= '0;
         else
-            reset_guard <= {reset_guard[1:0], 1'b1};
+            reset_release_pipe <= {
+                reset_release_pipe[1:0],
+                1'b1
+            };
     end
 
-    assign seq_to_reduce_ready_o =
-        (&reset_guard) &&
-        (state == IDLE) &&
-        (&pe_to_reduce_valid_i);
+    assign start_ready_o =
+        (&reset_release_pipe) &&
+        (state == WAIT_START);
 
-    assign accept =
-        seq_to_reduce_start_i &&
-        seq_to_reduce_ready_o;
-
-    // Все PE получают подтверждение одновременно.
-    assign pe_to_reduce_ready_o = {N_PE{accept}};
+    assign start_accepted =
+        start_i && start_ready_o;
 
     for (genvar p = 0; p < N_PE; p++) begin : g_parts
 
-        wire pe_to_rs_t item;
-
-        assign item = pe_to_reduce_data_i[p];
-
-        assign id_matches[p] =
-            item.neuron_id == seq_to_reduce_data_i.neuron_id;
-
         assign finite_parts[p] =
-            item.value[30:23] != 8'hFF;
+            pe_sums_i[p][30:23] != 8'hFF;
 
         always_ff @(posedge clk_i or negedge rst_n_i) begin
             if (!rst_n_i)
-                parts[p] <= 0;
-            else if (accept)
-                parts[p] <= item.value;
+                partial_sum_regs[p] <= '0;
+            else if (start_accepted)
+                partial_sum_regs[p] <= pe_sums_i[p];
         end
 
     end
 
-    // Интерфейс FP32-сумматора.
-    logic [31:0] add_b;
-    logic [31:0] add_result;
-    logic add_valid;
-    logic add_out_valid;
+    assign add_b = adding_bias_phase
+        ? bias_value_reg
+        : partial_sum_regs[partial_sum_index];
 
-    assign add_b = adding_bias
-        ? bias_reg
-        : parts[part_index];
-
-    // Один такт запуска, затем ожидание результата.
-    assign add_valid = (state == ADD_REQ);
+    assign add_request_valid = (state == ISSUE_ADD);
 
     fp32_add_ip u_add (
-        .aclk                  (clk_i),
-        .aresetn               (rst_n_i),
+        .aclk(clk_i),
+        .aresetn(rst_n_i),
 
-        .s_axis_a_tvalid       (add_valid),
-        .s_axis_a_tdata        (acc_reg),
+        .s_axis_a_tvalid(add_request_valid),
+        .s_axis_a_tdata(accumulator_reg),
 
-        .s_axis_b_tvalid       (add_valid),
-        .s_axis_b_tdata        (add_b),
+        .s_axis_b_tvalid(add_request_valid),
+        .s_axis_b_tdata(add_b),
 
-        .m_axis_result_tvalid  (add_out_valid),
-        .m_axis_result_tdata   (add_result)
+        .m_axis_result_tvalid(add_result_valid),
+        .m_axis_result_tdata(add_result)
     );
 
-    always_comb begin
-        reduce_to_sigmoid_data_o.neuron_id = neuron_reg;
-        reduce_to_sigmoid_data_o.value     = result_reg;
-        reduce_to_sigmoid_data_o.status    = status_reg;
-
-        reduce_to_sigmoid_valid_o = (state == RESULT);
-    end
+    assign result_data_o = result_value_reg;
+    assign result_status_o = result_status_reg;
+    assign result_valid_o = (state == RESULT_PENDING);
 
     always_ff @(posedge clk_i or negedge rst_n_i) begin
         if (!rst_n_i) begin
-            state        <= IDLE;
-            bias_reg     <= 0;
-            acc_reg      <= 0;
-            result_reg   <= 0;
-            neuron_reg   <= 0;
-            part_index   <= 0;
-            adding_bias  <= 0;
-            status_reg   <= RS_OK;
+            state <= WAIT_START;
+
+            bias_value_reg <= '0;
+            accumulator_reg <= '0;
+            result_value_reg <= '0;
+            result_status_reg <= RS_OK;
+
+            partial_sum_index <= 0;
+            adding_bias_phase <= 1'b0;
 
         end else begin
             case (state)
 
-                IDLE: begin
-                    if (accept) begin
-                        neuron_reg  <= seq_to_reduce_data_i.neuron_id;
-                        bias_reg    <= seq_to_reduce_data_i.bias;
+                WAIT_START: begin
+                    if (start_accepted) begin
+                        bias_value_reg <= bias_i;
 
-                        acc_reg     <= 0;
-                        result_reg  <= 0;
-                        status_reg  <= RS_OK;
+                        accumulator_reg <= '0;
+                        result_value_reg <= '0;
+                        result_status_reg <= RS_OK;
 
-                        part_index  <= (N_PE > 1) ? 1 : 0;
-                        adding_bias <= (N_PE == 1);
+                        partial_sum_index <=
+                            (N_PE > 1) ? 1 : 0;
 
-                        if (!(&id_matches)) begin
-                            status_reg <= RS_BAD_NEURON;
-                            state <= RESULT;
+                        adding_bias_phase <= (N_PE == 1);
 
-                        end else if (
+                        if (
                             !(&finite_parts) ||
-                            seq_to_reduce_data_i.bias[30:23] == 8'hFF
+                            bias_i[30:23] == 8'hFF
                         ) begin
-                            status_reg <= RS_NONFINITE;
-                            state <= RESULT;
-
+                            result_status_reg <= RS_NONFINITE;
+                            state <= RESULT_PENDING;
                         end else begin
-                            state <= LOAD_FIRST;
+                            state <= LOAD_FIRST_SUM;
                         end
                     end
                 end
 
-                LOAD_FIRST: begin
-                    // Первую часть загружаем без сложения.
-                    acc_reg <= parts[0];
-                    state <= ADD_REQ;
+                LOAD_FIRST_SUM: begin
+                    // Первую сумму загружаем без сложения.
+                    accumulator_reg <= partial_sum_regs[0];
+                    state <= ISSUE_ADD;
                 end
 
-                ADD_REQ: begin
-                    state <= ADD_WAIT;
+                ISSUE_ADD: begin
+                    state <= WAIT_ADD_RESULT;
                 end
 
-                ADD_WAIT: begin
-                    if (add_out_valid) begin
+                WAIT_ADD_RESULT: begin
+                    if (add_result_valid) begin
                         if (add_result[30:23] == 8'hFF) begin
-                            status_reg <= RS_ARITH_ERROR;
-                            state <= RESULT;
+                            result_status_reg <= RS_ARITH_ERROR;
+                            state <= RESULT_PENDING;
 
-                        end else if (adding_bias) begin
-                            result_reg <= add_result;
-                            state <= RESULT;
+                        end else if (adding_bias_phase) begin
+                            result_value_reg <= add_result;
+                            state <= RESULT_PENDING;
 
                         end else begin
-                            acc_reg <= add_result;
+                            accumulator_reg <= add_result;
 
-                            if (part_index == N_PE - 1)
-                                adding_bias <= 1'b1;
+                            if (partial_sum_index == N_PE - 1)
+                                adding_bias_phase <= 1'b1;
                             else
-                                part_index <= part_index + 1;
+                                partial_sum_index <=
+                                    partial_sum_index + 1;
 
-                            state <= ADD_REQ;
+                            state <= ISSUE_ADD;
                         end
                     end
                 end
 
-                RESULT: begin
-                    if (
-                        reduce_to_sigmoid_valid_o &&
-                        reduce_to_sigmoid_ready_i
-                    ) begin
-                        state <= IDLE;
-                    end
+                RESULT_PENDING: begin
+                    if (result_valid_o && result_ready_i)
+                        state <= WAIT_START;
                 end
 
-                default: state <= IDLE;
+                default: begin
+                    state <= WAIT_START;
+                end
 
             endcase
         end

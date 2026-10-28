@@ -8,145 +8,150 @@ module pe #(
     input logic clk_i,
     input logic rst_n_i,
 
-    // Команды секвенсора.
-    input pe_types_pkg::seq_to_pe_t seq_to_pe_data_i,
-    input  logic seq_to_pe_valid_i,
-    output logic seq_to_pe_ready_o,
+    // Секвенсор -> PE: команда и её параметры.
+    input pe_types_pkg::seq_to_pe_t seq_to_pe_command_i,
+    input logic seq_to_pe_command_valid_i,
 
-    // Частичная сумма напрямую в reduce.
-    output rs_types_pkg::pe_to_rs_t pe_to_reduce_data_o,
-    output logic pe_to_reduce_valid_o,
-    input  logic pe_to_reduce_ready_i,
+    // PE -> секвенсор: готовность принять команду.
+    output logic pe_to_seq_command_ready_o,
 
-    // Все суммы слоя вычислены и сохранены.
-    output logic pe_done_o,
+    // PE -> reduce: частичная сумма текущего нейрона.
+    output logic [31:0] pe_to_reduce_sum_o,
 
-    // Код ошибки; PE_OK при отсутствии ошибки.
-    output pe_types_pkg::pe_status_t pe_status_o
+    // PE -> секвенсор: текущая сумма выставлена на выходе.
+    output logic pe_to_seq_sum_valid_o,
+
+    // PE -> секвенсор: все суммы слоя вычислены.
+    // Впервые устанавливается после выставления первой суммы.
+    output logic pe_to_seq_layer_done_o,
+
+    // PE -> секвенсор: статус выполнения.
+    output pe_types_pkg::pe_status_t pe_to_seq_status_o
 );
 
     import pe_types_pkg::*;
     import memory_types_pkg::*;
 
-    localparam logic [31:0] MEM_BYTES =
+    localparam logic [31:0] LOCAL_MEM_BYTES =
         $unsigned(MEM_WORDS) << 2;
 
-    localparam logic [31:0] WORD_LIMIT =
+    localparam logic [31:0] LOCAL_MEM_WORDS =
         $unsigned(MEM_WORDS);
 
-    localparam logic [63:0] MEM_CAPACITY =
-        {32'd0, MEM_BYTES};
+    localparam logic [63:0] LOCAL_MEM_CAPACITY_BYTES =
+        {32'd0, LOCAL_MEM_BYTES};
 
     typedef enum logic [3:0] {
-        CONTROL,
-        CLEAR_SUMS,
-        MAC_READ,
-        PAIR_WAIT,
-        MUL_WAIT,
-        ADD_REQ,
-        ADD_WAIT,
-        STORE,
-        STORE_WAIT,
-        OUT_READ,
-        OUT_WAIT,
-        OUT_VALID,
-        HOLD,
-        ERROR
+        WAIT_SEQ_COMMAND,
+        CLEAR_LOCAL_SUMS,
+        REQUEST_WEIGHT_AND_INPUT,
+        WAIT_WEIGHT_AND_INPUT,
+        WAIT_PRODUCT_AND_PREVIOUS_SUM,
+        ISSUE_ACCUMULATE,
+        WAIT_ACCUMULATE_RESULT,
+        WRITE_UPDATED_SUM,
+        WAIT_SUM_WRITE_RESPONSE,
+        REQUEST_OUTPUT_SUM,
+        WAIT_OUTPUT_SUM,
+        HOLD_OUTPUT_SUM,
+        FAULT
     } state_t;
 
-    state_t state;
+    state_t pe_state;
 
-    // --------------------------------------------------------
-    // Конфигурация и управляющие регистры.
-    // --------------------------------------------------------
+    // Конфигурация текущего слоя.
+    pe_cfg_t layer_config_reg;
 
-    pe_cfg_t cfg_reg;
-    pe_status_t status_reg;
+    pe_status_t error_status_reg;
 
-    logic configured;
-    logic done_reg;
+    logic config_valid_reg;
+    logic layer_done_reg;
 
-    logic [2:0] reset_guard;
+    logic [2:0] reset_release_pipe;
 
-    logic command_fire;
-    logic write_addr_ok;
-    logic cfg_legal;
-    logic agu_addr_ok;
+    // Приём и проверка команды секвенсора.
+    logic seq_command_accepted;
+    logic seq_write_address_valid;
+    logic seq_config_valid;
 
-    logic [31:0] clear_addr;
-    logic [31:0] out_addr;
+    // Проверка адресов, выданных AGU.
+    logic agu_addresses_valid;
 
-    logic [31:0] x_limit;
-    logic [31:0] s_limit;
+    // Адрес обнуления очередной локальной суммы.
+    logic [31:0] sum_clear_address_reg;
 
-    logic [15:0] last_neuron;
-    logic [15:0] clear_index;
-    logic [15:0] out_neuron;
+    // Адрес суммы, которую нужно выставить на выход.
+    logic [31:0] sum_output_address_reg;
 
-    // Выходной регистр и регистры арифметического тракта.
-    logic [31:0] output_value;
-    logic [31:0] old_sum;
-    logic [31:0] product;
-    logic [31:0] new_sum;
+    // Исключающие верхние границы областей X и S.
+    logic [31:0] input_region_end_reg;
+    logic [31:0] sum_region_end_reg;
 
-    logic sum_seen;
-    logic product_seen;
+    logic [15:0] last_neuron_index_reg;
+    logic [15:0] sum_clear_index_reg;
+    logic [15:0] output_neuron_index_reg;
 
-    // --------------------------------------------------------
-    // Интерфейсы двух портов локальной памяти.
-    // --------------------------------------------------------
+    // Выходной регистр частичной суммы.
+    logic [31:0] output_sum_reg;
 
-    mem_req_t a_req;
-    mem_req_t b_req;
+    // Регистры вычисления S[j] + W[q] * X[i].
+    logic [31:0] previous_sum_reg;
+    logic [31:0] weight_input_product_reg;
+    logic [31:0] updated_sum_reg;
 
-    mem_rsp_t a_rsp;
-    mem_rsp_t b_rsp;
+    logic previous_sum_received_reg;
+    logic product_received_reg;
 
-    logic a_valid;
-    logic b_valid;
+    // PE -> локальная память: запросы портов A и B.
+    mem_req_t pe_to_local_mem_a_request;
+    mem_req_t pe_to_local_mem_b_request;
 
-    logic a_ready;
-    logic b_ready;
+    logic pe_to_local_mem_a_request_valid;
+    logic pe_to_local_mem_b_request_valid;
 
-    logic a_rsp_valid;
-    logic b_rsp_valid;
+    // Локальная память -> PE: готовность принять запросы.
+    logic local_mem_a_to_pe_request_ready;
+    logic local_mem_b_to_pe_request_ready;
 
-    // --------------------------------------------------------
-    // Интерфейс AGU.
-    // --------------------------------------------------------
+    // Локальная память -> PE: ответы на запросы.
+    mem_rsp_t local_mem_a_to_pe_response;
+    mem_rsp_t local_mem_b_to_pe_response;
 
-    agu_to_pe_t agu_data;
+    logic local_mem_a_to_pe_response_valid;
+    logic local_mem_b_to_pe_response_valid;
 
-    logic agu_valid;
-    logic agu_load;
-    logic agu_advance;
+    // AGU -> PE: адреса текущей операции MAC.
+    agu_to_pe_t agu_to_pe_addresses;
+    logic agu_to_pe_addresses_valid;
 
-    // --------------------------------------------------------
-    // Интерфейсы арифметических IP.
-    // --------------------------------------------------------
+    // PE -> AGU: загрузка начального состояния
+    // и переход к следующей операции MAC.
+    logic pe_to_agu_load;
+    logic pe_to_agu_advance;
 
-    logic mul_launch;
-    logic mul_out_valid;
+    // PE -> умножитель: запуск произведения W * X.
+    logic pe_to_multiplier_request_valid;
 
-    logic add_launch;
-    logic add_out_valid;
+    // Умножитель -> PE: результат произведения.
+    logic [31:0] multiplier_to_pe_result;
+    logic multiplier_to_pe_result_valid;
 
-    logic [31:0] mul_result;
-    logic [31:0] add_result;
+    // PE -> сумматор: запуск S + произведение.
+    logic pe_to_adder_request_valid;
 
-    // --------------------------------------------------------
-    // Проверки адресов и конфигурации.
-    // --------------------------------------------------------
+    // Сумматор -> PE: обновлённая сумма.
+    logic [31:0] adder_to_pe_result;
+    logic adder_to_pe_result_valid;
 
-    function automatic logic physical_addr_ok(
+    function automatic logic local_address_valid(
         input logic [31:0] addr
     );
         return
             addr[1:0] == 2'b00 &&
-            addr < MEM_BYTES;
+            addr < LOCAL_MEM_BYTES;
     endfunction
 
-    function automatic logic overlap(
+    function automatic logic address_ranges_overlap(
         input logic [63:0] lo_a,
         input logic [63:0] hi_a,
         input logic [63:0] lo_b,
@@ -159,594 +164,741 @@ module pe #(
             lo_b < hi_a;
     endfunction
 
-    // Проверка размещения активных областей.
-    // Правильность mac_count и шагов обеспечивает секвенсор.
-    function automatic logic config_ok(
-        input pe_cfg_t c
+    // Проверка размещения активных областей памяти.
+    // Соответствие mac_count и шагов распределению весов
+    // обеспечивает секвенсор.
+    function automatic logic layer_configuration_valid(
+        input pe_cfg_t candidate_config
     );
-        logic [63:0] wb;
-        logic [63:0] xb;
-        logic [63:0] sb;
+        logic [63:0] weights_begin;
+        logic [63:0] weights_end;
 
-        logic [63:0] we;
-        logic [63:0] xe;
-        logic [63:0] se;
+        logic [63:0] inputs_begin;
+        logic [63:0] inputs_end;
 
-        wb = {32'd0, c.w_base};
-        xb = {32'd0, c.x_base};
-        sb = {32'd0, c.s_base};
+        logic [63:0] sums_begin;
+        logic [63:0] sums_end;
 
-        we = wb + ({32'd0, c.mac_count} << 2);
-        xe = xb + ({48'd0, c.n_in} << 2);
-        se = sb + ({48'd0, c.n_out} << 2);
+        weights_begin = {
+            32'd0,
+            candidate_config.w_base
+        };
+
+        inputs_begin = {
+            32'd0,
+            candidate_config.x_base
+        };
+
+        sums_begin = {
+            32'd0,
+            candidate_config.s_base
+        };
+
+        weights_end = weights_begin +
+            ({32'd0, candidate_config.mac_count} << 2);
+
+        inputs_end = inputs_begin +
+            ({48'd0, candidate_config.n_in} << 2);
+
+        sums_end = sums_begin +
+            ({48'd0, candidate_config.n_out} << 2);
 
         return
-            c.n_in != 0 &&
-            c.n_out != 0 &&
+            candidate_config.n_in != 0 &&
+            candidate_config.n_out != 0 &&
 
-            c.w_base[1:0] == 2'b00 &&
-            c.x_base[1:0] == 2'b00 &&
-            c.s_base[1:0] == 2'b00 &&
+            candidate_config.w_base[1:0] == 2'b00 &&
+            candidate_config.x_base[1:0] == 2'b00 &&
+            candidate_config.s_base[1:0] == 2'b00 &&
 
-            c.mac_count <= WORD_LIMIT &&
+            candidate_config.mac_count <= LOCAL_MEM_WORDS &&
 
-            we <= MEM_CAPACITY &&
-            xe <= MEM_CAPACITY &&
-            se <= MEM_CAPACITY &&
+            weights_end <= LOCAL_MEM_CAPACITY_BYTES &&
+            inputs_end <= LOCAL_MEM_CAPACITY_BYTES &&
+            sums_end <= LOCAL_MEM_CAPACITY_BYTES &&
 
-            c.j_first < c.n_out &&
-            c.j_step < c.n_out &&
+            candidate_config.j_first <
+                candidate_config.n_out &&
 
-            (c.mac_count == 0 || c.i_first < c.n_in) &&
+            candidate_config.j_step <
+                candidate_config.n_out &&
 
-            !overlap(wb, we, xb, xe) &&
-            !overlap(wb, we, sb, se) &&
-            !overlap(xb, xe, sb, se);
+            (
+                candidate_config.mac_count == 0 ||
+                candidate_config.i_first <
+                    candidate_config.n_in
+            ) &&
+
+            !address_ranges_overlap(
+                weights_begin,
+                weights_end,
+                inputs_begin,
+                inputs_end
+            ) &&
+
+            !address_ranges_overlap(
+                weights_begin,
+                weights_end,
+                sums_begin,
+                sums_end
+            ) &&
+
+            !address_ranges_overlap(
+                inputs_begin,
+                inputs_end,
+                sums_begin,
+                sums_end
+            );
     endfunction
 
-    // --------------------------------------------------------
-    // Универсальная memory используется как локальная память.
-    // --------------------------------------------------------
-
-    memory #(
+        memory #(
         .MEM_WORDS(MEM_WORDS)
     ) u_local_memory (
-        .clk_i  (clk_i),
+        .clk_i(clk_i),
         .rst_n_i(rst_n_i),
 
-        .a_req_data_i (a_req),
-        .a_req_valid_i(a_valid),
-        .a_req_ready_o(a_ready),
+        // Порт A: запрос PE -> локальная память.
+        .a_client_to_mem_request_data_i(
+            pe_to_local_mem_a_request
+        ),
+        .a_client_to_mem_request_valid_i(
+            pe_to_local_mem_a_request_valid
+        ),
+        .a_mem_to_client_request_ready_o(
+            local_mem_a_to_pe_request_ready
+        ),
 
-        .a_rsp_data_o (a_rsp),
-        .a_rsp_valid_o(a_rsp_valid),
-        .a_rsp_ready_i(1'b1),
+        // Порт A: ответ локальной памяти -> PE.
+        .a_mem_to_client_response_data_o(
+            local_mem_a_to_pe_response
+        ),
+        .a_mem_to_client_response_valid_o(
+            local_mem_a_to_pe_response_valid
+        ),
+        .a_client_to_mem_response_ready_i(1'b1),
 
-        .b_req_data_i (b_req),
-        .b_req_valid_i(b_valid),
-        .b_req_ready_o(b_ready),
+        // Порт B: запрос PE -> локальная память.
+        .b_client_to_mem_request_data_i(
+            pe_to_local_mem_b_request
+        ),
+        .b_client_to_mem_request_valid_i(
+            pe_to_local_mem_b_request_valid
+        ),
+        .b_mem_to_client_request_ready_o(
+            local_mem_b_to_pe_request_ready
+        ),
 
-        .b_rsp_data_o (b_rsp),
-        .b_rsp_valid_o(b_rsp_valid),
-        .b_rsp_ready_i(1'b1)
+        // Порт B: ответ локальной памяти -> PE.
+        .b_mem_to_client_response_data_o(
+            local_mem_b_to_pe_response
+        ),
+        .b_mem_to_client_response_valid_o(
+            local_mem_b_to_pe_response_valid
+        ),
+        .b_client_to_mem_response_ready_i(1'b1)
     );
 
-    // --------------------------------------------------------
-    // Генератор адресов.
-    // --------------------------------------------------------
-
-    pe_agu u_agu (
-        .clk_i  (clk_i),
+    pe_agu u_address_generator (
+        .clk_i(clk_i),
         .rst_n_i(rst_n_i),
 
-        .cfg_i    (cfg_reg),
-        .load_i   (agu_load),
-        .advance_i(agu_advance),
+        .cfg_i(layer_config_reg),
+        .load_i(pe_to_agu_load),
+        .advance_i(pe_to_agu_advance),
 
-        .agu_to_pe_data_o (agu_data),
-        .agu_to_pe_valid_o(agu_valid)
+        .agu_to_pe_data_o(agu_to_pe_addresses),
+        .agu_to_pe_valid_o(agu_to_pe_addresses_valid)
     );
 
-    // --------------------------------------------------------
-    // FP32-умножитель.
-    // --------------------------------------------------------
+    // Во время чтения пары:
+    // порт A возвращает вес, порт B - входное значение.
+    fp32_mul_ip u_multiplier (
+        .aclk(clk_i),
+        .aresetn(rst_n_i),
 
-    fp32_mul_ip u_mul (
-        .aclk                 (clk_i),
-        .aresetn              (rst_n_i),
+        .s_axis_a_tvalid(pe_to_multiplier_request_valid),
+        .s_axis_a_tdata(local_mem_a_to_pe_response.value),
 
-        .s_axis_a_tvalid      (mul_launch),
-        .s_axis_a_tdata       (a_rsp.value),
+        .s_axis_b_tvalid(pe_to_multiplier_request_valid),
+        .s_axis_b_tdata(local_mem_b_to_pe_response.value),
 
-        .s_axis_b_tvalid      (mul_launch),
-        .s_axis_b_tdata       (b_rsp.value),
-
-        .m_axis_result_tvalid (mul_out_valid),
-        .m_axis_result_tdata  (mul_result)
+        .m_axis_result_tvalid(multiplier_to_pe_result_valid),
+        .m_axis_result_tdata(multiplier_to_pe_result)
     );
 
-    // --------------------------------------------------------
-    // FP32-сумматор: old_sum + product.
-    // --------------------------------------------------------
+    fp32_add_ip u_adder (
+        .aclk(clk_i),
+        .aresetn(rst_n_i),
 
-    fp32_add_ip u_add (
-        .aclk                 (clk_i),
-        .aresetn              (rst_n_i),
+        .s_axis_a_tvalid(pe_to_adder_request_valid),
+        .s_axis_a_tdata(previous_sum_reg),
 
-        .s_axis_a_tvalid      (add_launch),
-        .s_axis_a_tdata       (old_sum),
+        .s_axis_b_tvalid(pe_to_adder_request_valid),
+        .s_axis_b_tdata(weight_input_product_reg),
 
-        .s_axis_b_tvalid      (add_launch),
-        .s_axis_b_tdata       (product),
-
-        .m_axis_result_tvalid (add_out_valid),
-        .m_axis_result_tdata  (add_result)
+        .m_axis_result_tvalid(adder_to_pe_result_valid),
+        .m_axis_result_tdata(adder_to_pe_result)
     );
 
-    // Пауза после снятия сброса для арифметических IP.
+    // Защитная пауза после снятия сброса.
     always_ff @(posedge clk_i or negedge rst_n_i) begin
         if (!rst_n_i)
-            reset_guard <= 3'b000;
+            reset_release_pipe <= '0;
         else
-            reset_guard <= {reset_guard[1:0], 1'b1};
+            reset_release_pipe <= {
+                reset_release_pipe[1:0],
+                1'b1
+            };
     end
 
-    // --------------------------------------------------------
-    // Комбинационная логика управления.
-    // --------------------------------------------------------
-
     always_comb begin
-        seq_to_pe_ready_o =
-            (&reset_guard) &&
-            (state == CONTROL || state == HOLD);
+        pe_to_seq_command_ready_o =
+            (&reset_release_pipe) &&
+            (
+                pe_state == WAIT_SEQ_COMMAND ||
+                pe_state == HOLD_OUTPUT_SUM
+            );
 
         if (
-            seq_to_pe_data_i.op == PE_WRITE &&
-            state == CONTROL
+            seq_to_pe_command_i.op == PE_WRITE &&
+            pe_state == WAIT_SEQ_COMMAND
         ) begin
-            seq_to_pe_ready_o =
-                seq_to_pe_ready_o && a_ready;
+            pe_to_seq_command_ready_o =
+                pe_to_seq_command_ready_o &&
+                local_mem_a_to_pe_request_ready;
         end
 
-        command_fire =
-            seq_to_pe_valid_i && seq_to_pe_ready_o;
+        seq_command_accepted =
+            seq_to_pe_command_valid_i &&
+            pe_to_seq_command_ready_o;
 
-        cfg_legal =
-            config_ok(seq_to_pe_data_i.cfg);
+        seq_config_valid =
+            layer_configuration_valid(
+                seq_to_pe_command_i.cfg
+            );
 
-        write_addr_ok =
-            physical_addr_ok(seq_to_pe_data_i.addr);
+        seq_write_address_valid =
+            local_address_valid(
+                seq_to_pe_command_i.addr
+            );
 
-        agu_addr_ok =
-            agu_valid &&
+        agu_addresses_valid =
+            agu_to_pe_addresses_valid &&
 
-            physical_addr_ok(agu_data.w_addr) &&
-            physical_addr_ok(agu_data.x_addr) &&
-            physical_addr_ok(agu_data.s_addr) &&
+            local_address_valid(
+                agu_to_pe_addresses.w_addr
+            ) &&
 
-            agu_data.x_addr >= cfg_reg.x_base &&
-            agu_data.x_addr < x_limit &&
+            local_address_valid(
+                agu_to_pe_addresses.x_addr
+            ) &&
 
-            agu_data.s_addr >= cfg_reg.s_base &&
-            agu_data.s_addr < s_limit;
+            local_address_valid(
+                agu_to_pe_addresses.s_addr
+            ) &&
+
+            agu_to_pe_addresses.x_addr >=
+                layer_config_reg.x_base &&
+
+            agu_to_pe_addresses.x_addr <
+                input_region_end_reg &&
+
+            agu_to_pe_addresses.s_addr >=
+                layer_config_reg.s_base &&
+
+            agu_to_pe_addresses.s_addr <
+                sum_region_end_reg;
 
         // Начальное состояние AGU загружается при START.
-        agu_load =
-            command_fire &&
-            seq_to_pe_data_i.op == PE_START &&
-            configured;
+        pe_to_agu_load =
+            seq_command_accepted &&
+            seq_to_pe_command_i.op == PE_START &&
+            config_valid_reg;
 
         // Адреса продвигаются после подтверждения записи S[j].
-        agu_advance =
-            state == STORE_WAIT &&
-            a_rsp_valid &&
-            !a_rsp.error;
+        pe_to_agu_advance =
+            pe_state == WAIT_SUM_WRITE_RESPONSE &&
+            local_mem_a_to_pe_response_valid &&
+            !local_mem_a_to_pe_response.error;
 
-        // Умножение запускается по готовности W и X.
-        mul_launch =
-            state == PAIR_WAIT &&
-            a_rsp_valid &&
-            b_rsp_valid &&
-            !a_rsp.error &&
-            !b_rsp.error &&
-            a_rsp.value[30:23] != 8'hFF &&
-            b_rsp.value[30:23] != 8'hFF &&
-            a_ready;
+        // Запуск произведения после получения W и X.
+        // Одновременно порт A должен принять чтение S[j].
+        pe_to_multiplier_request_valid =
+            pe_state == WAIT_WEIGHT_AND_INPUT &&
 
-        add_launch = (state == ADD_REQ);
+            local_mem_a_to_pe_response_valid &&
+            local_mem_b_to_pe_response_valid &&
 
-        // Значения по умолчанию предотвращают защёлки.
-        a_req = '0;
-        b_req = '0;
+            !local_mem_a_to_pe_response.error &&
+            !local_mem_b_to_pe_response.error &&
 
-        a_valid = 1'b0;
-        b_valid = 1'b0;
+            local_mem_a_to_pe_response.value[30:23] !=
+                8'hFF &&
 
-        case (state)
+            local_mem_b_to_pe_response.value[30:23] !=
+                8'hFF &&
 
-            CONTROL: begin
+            local_mem_a_to_pe_request_ready;
+
+        pe_to_adder_request_valid =
+            (pe_state == ISSUE_ACCUMULATE);
+
+        pe_to_local_mem_a_request = '0;
+        pe_to_local_mem_b_request = '0;
+
+        pe_to_local_mem_a_request_valid = 1'b0;
+        pe_to_local_mem_b_request_valid = 1'b0;
+
+        case (pe_state)
+
+            WAIT_SEQ_COMMAND: begin
                 if (
-                    command_fire &&
-                    seq_to_pe_data_i.op == PE_WRITE &&
-                    write_addr_ok
+                    seq_command_accepted &&
+                    seq_to_pe_command_i.op == PE_WRITE &&
+                    seq_write_address_valid
                 ) begin
-                    a_req.write = 1'b1;
-                    a_req.addr  = seq_to_pe_data_i.addr;
-                    a_req.value = seq_to_pe_data_i.value;
+                    pe_to_local_mem_a_request.write = 1'b1;
 
-                    a_valid = 1'b1;
+                    pe_to_local_mem_a_request.addr =
+                        seq_to_pe_command_i.addr;
+
+                    pe_to_local_mem_a_request.value =
+                        seq_to_pe_command_i.value;
+
+                    pe_to_local_mem_a_request_valid = 1'b1;
                 end
             end
 
-            CLEAR_SUMS: begin
-                a_req.write = 1'b1;
-                a_req.addr  = clear_addr;
-                a_req.value = 32'd0;
+            CLEAR_LOCAL_SUMS: begin
+                pe_to_local_mem_a_request.write = 1'b1;
 
-                a_valid = 1'b1;
+                pe_to_local_mem_a_request.addr =
+                    sum_clear_address_reg;
+
+                pe_to_local_mem_a_request.value = 32'd0;
+
+                pe_to_local_mem_a_request_valid = 1'b1;
             end
 
-            MAC_READ: begin
-                if (agu_addr_ok) begin
-                    // Одновременно читаем W[q] и X[i].
-                    a_req.addr = agu_data.w_addr;
-                    b_req.addr = agu_data.x_addr;
+            REQUEST_WEIGHT_AND_INPUT: begin
+                if (agu_addresses_valid) begin
+                    pe_to_local_mem_a_request.addr =
+                        agu_to_pe_addresses.w_addr;
 
-                    a_valid = 1'b1;
-                    b_valid = 1'b1;
+                    pe_to_local_mem_b_request.addr =
+                        agu_to_pe_addresses.x_addr;
+
+                    pe_to_local_mem_a_request_valid = 1'b1;
+                    pe_to_local_mem_b_request_valid = 1'b1;
                 end
             end
 
-            PAIR_WAIT: begin
-                if (mul_launch) begin
-                    // Во время запуска умножения читаем S[j].
-                    a_req.addr = agu_data.s_addr;
-                    a_valid = 1'b1;
+            WAIT_WEIGHT_AND_INPUT: begin
+                if (pe_to_multiplier_request_valid) begin
+                    pe_to_local_mem_a_request.addr =
+                        agu_to_pe_addresses.s_addr;
+
+                    pe_to_local_mem_a_request_valid = 1'b1;
                 end
             end
 
-            STORE: begin
-                a_req.write = 1'b1;
-                a_req.addr  = agu_data.s_addr;
-                a_req.value = new_sum;
+            WRITE_UPDATED_SUM: begin
+                pe_to_local_mem_a_request.write = 1'b1;
 
-                a_valid = 1'b1;
+                pe_to_local_mem_a_request.addr =
+                    agu_to_pe_addresses.s_addr;
+
+                pe_to_local_mem_a_request.value =
+                    updated_sum_reg;
+
+                pe_to_local_mem_a_request_valid = 1'b1;
             end
 
-            OUT_READ: begin
-                a_req.addr = out_addr;
-                a_valid = 1'b1;
+            REQUEST_OUTPUT_SUM: begin
+                pe_to_local_mem_a_request.addr =
+                    sum_output_address_reg;
+
+                pe_to_local_mem_a_request_valid = 1'b1;
             end
 
             default: ;
 
         endcase
 
-        // Выходной регистр частичной суммы.
-        pe_to_reduce_data_o.neuron_id = out_neuron;
-        pe_to_reduce_data_o.value     = output_value;
+        pe_to_reduce_sum_o = output_sum_reg;
 
-        pe_to_reduce_valid_o = (state == OUT_VALID);
+        pe_to_seq_sum_valid_o =
+            (pe_state == HOLD_OUTPUT_SUM);
 
-        pe_done_o   = done_reg;
-        pe_status_o = status_reg;
+        pe_to_seq_layer_done_o = layer_done_reg;
+        pe_to_seq_status_o = error_status_reg;
     end
-
-    // --------------------------------------------------------
-    // Последовательная логика.
-    // --------------------------------------------------------
 
     always_ff @(posedge clk_i or negedge rst_n_i) begin
         if (!rst_n_i) begin
-            state      <= CONTROL;
-            cfg_reg    <= '0;
-            configured <= 1'b0;
+            pe_state <= WAIT_SEQ_COMMAND;
 
-            done_reg   <= 1'b0;
-            status_reg <= PE_OK;
+            layer_config_reg <= '0;
+            config_valid_reg <= 1'b0;
 
-            clear_addr <= 0;
-            out_addr   <= 0;
+            layer_done_reg <= 1'b0;
+            error_status_reg <= PE_OK;
 
-            x_limit <= 0;
-            s_limit <= 0;
+            sum_clear_address_reg <= '0;
+            sum_output_address_reg <= '0;
 
-            last_neuron <= 0;
-            clear_index <= 0;
-            out_neuron  <= 0;
+            input_region_end_reg <= '0;
+            sum_region_end_reg <= '0;
 
-            output_value <= 0;
-            old_sum      <= 0;
-            product      <= 0;
-            new_sum      <= 0;
+            last_neuron_index_reg <= '0;
+            sum_clear_index_reg <= '0;
+            output_neuron_index_reg <= '0;
 
-            sum_seen     <= 1'b0;
-            product_seen <= 1'b0;
+            output_sum_reg <= '0;
+            previous_sum_reg <= '0;
+            weight_input_product_reg <= '0;
+            updated_sum_reg <= '0;
+
+            previous_sum_received_reg <= 1'b0;
+            product_received_reg <= 1'b0;
 
         end else begin
-            case (state)
+            case (pe_state)
 
-                CONTROL, HOLD: begin
-                    if (command_fire) begin
-                        case (seq_to_pe_data_i.op)
+                WAIT_SEQ_COMMAND,
+                HOLD_OUTPUT_SUM: begin
+                    if (seq_command_accepted) begin
+                        case (seq_to_pe_command_i.op)
 
                             PE_CONFIG: begin
-                                if (cfg_legal) begin
-                                    cfg_reg <= seq_to_pe_data_i.cfg;
-                                    configured <= 1'b1;
+                                if (seq_config_valid) begin
+                                    layer_config_reg <=
+                                        seq_to_pe_command_i.cfg;
 
-                                    x_limit <=
-                                        seq_to_pe_data_i.cfg.x_base +
+                                    config_valid_reg <= 1'b1;
+
+                                    input_region_end_reg <=
+                                        seq_to_pe_command_i.cfg.x_base +
                                         (
-                                            {16'd0,
-                                             seq_to_pe_data_i.cfg.n_in}
-                                            << 2
+                                            {
+                                                16'd0,
+                                                seq_to_pe_command_i.cfg.n_in
+                                            } << 2
                                         );
 
-                                    s_limit <=
-                                        seq_to_pe_data_i.cfg.s_base +
+                                    sum_region_end_reg <=
+                                        seq_to_pe_command_i.cfg.s_base +
                                         (
-                                            {16'd0,
-                                             seq_to_pe_data_i.cfg.n_out}
-                                            << 2
+                                            {
+                                                16'd0,
+                                                seq_to_pe_command_i.cfg.n_out
+                                            } << 2
                                         );
 
-                                    last_neuron <=
-                                        seq_to_pe_data_i.cfg.n_out
-                                        - 16'd1;
+                                    last_neuron_index_reg <=
+                                        seq_to_pe_command_i.cfg.n_out -
+                                        16'd1;
 
-                                    done_reg <= 1'b0;
-                                    status_reg <= PE_OK;
+                                    layer_done_reg <= 1'b0;
+                                    error_status_reg <= PE_OK;
 
-                                    state <= CONTROL;
+                                    pe_state <= WAIT_SEQ_COMMAND;
 
                                 end else begin
-                                    status_reg <= PE_BAD_CFG;
-                                    done_reg <= 1'b0;
-                                    state <= ERROR;
+                                    error_status_reg <= PE_BAD_CFG;
+                                    layer_done_reg <= 1'b0;
+                                    pe_state <= FAULT;
                                 end
                             end
 
                             PE_WRITE: begin
-                                if (state != CONTROL) begin
-                                    status_reg <= PE_BAD_CMD;
-                                    done_reg <= 1'b0;
-                                    state <= ERROR;
+                                if (
+                                    pe_state != WAIT_SEQ_COMMAND
+                                ) begin
+                                    error_status_reg <= PE_BAD_CMD;
+                                    layer_done_reg <= 1'b0;
+                                    pe_state <= FAULT;
 
-                                end else if (!write_addr_ok) begin
-                                    status_reg <= PE_BAD_ADDR;
-                                    done_reg <= 1'b0;
-                                    state <= ERROR;
+                                end else if (
+                                    !seq_write_address_valid
+                                ) begin
+                                    error_status_reg <= PE_BAD_ADDR;
+                                    layer_done_reg <= 1'b0;
+                                    pe_state <= FAULT;
                                 end
 
-                                // При корректном адресе запись
-                                // выполняет комбинационная логика
-                                // через порт A памяти.
+                                // Корректная запись выполняется
+                                // через порт A локальной памяти.
                             end
 
                             PE_START: begin
-                                if (configured) begin
-                                    clear_index <= 0;
-                                    clear_addr <= cfg_reg.s_base;
+                                if (config_valid_reg) begin
+                                    sum_clear_index_reg <= '0;
 
-                                    out_neuron <= 0;
-                                    out_addr <= cfg_reg.s_base;
+                                    sum_clear_address_reg <=
+                                        layer_config_reg.s_base;
 
-                                    done_reg <= 1'b0;
+                                    output_neuron_index_reg <= '0;
 
-                                    sum_seen <= 1'b0;
-                                    product_seen <= 1'b0;
+                                    sum_output_address_reg <=
+                                        layer_config_reg.s_base;
 
-                                    status_reg <= PE_OK;
-                                    state <= CLEAR_SUMS;
+                                    layer_done_reg <= 1'b0;
+
+                                    previous_sum_received_reg <= 1'b0;
+                                    product_received_reg <= 1'b0;
+
+                                    error_status_reg <= PE_OK;
+                                    pe_state <= CLEAR_LOCAL_SUMS;
 
                                 end else begin
-                                    status_reg <= PE_BAD_CMD;
-                                    state <= ERROR;
+                                    error_status_reg <= PE_BAD_CMD;
+                                    pe_state <= FAULT;
                                 end
                             end
 
                             PE_NEXT: begin
                                 if (
-                                    state == HOLD &&
-                                    done_reg &&
-                                    out_neuron < last_neuron
+                                    pe_state == HOLD_OUTPUT_SUM &&
+                                    layer_done_reg &&
+                                    output_neuron_index_reg <
+                                        last_neuron_index_reg
                                 ) begin
-                                    out_neuron <=
-                                        out_neuron + 16'd1;
+                                    output_neuron_index_reg <=
+                                        output_neuron_index_reg +
+                                        16'd1;
 
-                                    out_addr <= out_addr + 32'd4;
+                                    sum_output_address_reg <=
+                                        sum_output_address_reg +
+                                        32'd4;
 
-                                    state <= OUT_READ;
+                                    pe_state <= REQUEST_OUTPUT_SUM;
 
                                 end else begin
-                                    status_reg <= PE_BAD_CMD;
-                                    done_reg <= 1'b0;
-                                    state <= ERROR;
+                                    error_status_reg <= PE_BAD_CMD;
+                                    layer_done_reg <= 1'b0;
+                                    pe_state <= FAULT;
                                 end
                             end
 
                             default: begin
-                                status_reg <= PE_BAD_CMD;
-                                done_reg <= 1'b0;
-                                state <= ERROR;
+                                error_status_reg <= PE_BAD_CMD;
+                                layer_done_reg <= 1'b0;
+                                pe_state <= FAULT;
                             end
 
                         endcase
                     end
                 end
 
-                CLEAR_SUMS: begin
-                    if (a_valid && a_ready) begin
-                        if (clear_index == last_neuron) begin
-                            state <= (cfg_reg.mac_count == 0)
-                                ? OUT_READ
-                                : MAC_READ;
+                CLEAR_LOCAL_SUMS: begin
+                    if (
+                        pe_to_local_mem_a_request_valid &&
+                        local_mem_a_to_pe_request_ready
+                    ) begin
+                        if (
+                            sum_clear_index_reg ==
+                                last_neuron_index_reg
+                        ) begin
+                            pe_state <=
+                                (layer_config_reg.mac_count == 0)
+                                    ? REQUEST_OUTPUT_SUM
+                                    : REQUEST_WEIGHT_AND_INPUT;
 
                         end else begin
-                            clear_index <= clear_index + 16'd1;
-                            clear_addr <= clear_addr + 32'd4;
+                            sum_clear_index_reg <=
+                                sum_clear_index_reg + 16'd1;
+
+                            sum_clear_address_reg <=
+                                sum_clear_address_reg + 32'd4;
                         end
                     end
                 end
 
-                MAC_READ: begin
-                    if (!agu_addr_ok) begin
-                        status_reg <= PE_BAD_ADDR;
-                        state <= ERROR;
+                REQUEST_WEIGHT_AND_INPUT: begin
+                    if (!agu_addresses_valid) begin
+                        error_status_reg <= PE_BAD_ADDR;
+                        pe_state <= FAULT;
 
                     end else if (
-                        a_valid && a_ready &&
-                        b_valid && b_ready
+                        pe_to_local_mem_a_request_valid &&
+                        local_mem_a_to_pe_request_ready &&
+                        pe_to_local_mem_b_request_valid &&
+                        local_mem_b_to_pe_request_ready
                     ) begin
-                        sum_seen <= 1'b0;
-                        product_seen <= 1'b0;
+                        previous_sum_received_reg <= 1'b0;
+                        product_received_reg <= 1'b0;
 
-                        state <= PAIR_WAIT;
+                        pe_state <= WAIT_WEIGHT_AND_INPUT;
                     end
                 end
 
-                PAIR_WAIT: begin
-                    if (a_rsp_valid && b_rsp_valid) begin
-                        if (a_rsp.error || b_rsp.error) begin
-                            status_reg <= PE_BAD_ADDR;
-                            state <= ERROR;
+                WAIT_WEIGHT_AND_INPUT: begin
+                    if (
+                        local_mem_a_to_pe_response_valid &&
+                        local_mem_b_to_pe_response_valid
+                    ) begin
+                        if (
+                            local_mem_a_to_pe_response.error ||
+                            local_mem_b_to_pe_response.error
+                        ) begin
+                            error_status_reg <= PE_BAD_ADDR;
+                            pe_state <= FAULT;
 
                         end else if (
-                            a_rsp.value[30:23] == 8'hFF ||
-                            b_rsp.value[30:23] == 8'hFF
+                            local_mem_a_to_pe_response.value[30:23]
+                                == 8'hFF ||
+                            local_mem_b_to_pe_response.value[30:23]
+                                == 8'hFF
                         ) begin
-                            status_reg <= PE_BAD_FP;
-                            state <= ERROR;
+                            error_status_reg <= PE_BAD_FP;
+                            pe_state <= FAULT;
 
-                        end else if (mul_launch) begin
-                            state <= MUL_WAIT;
+                        end else if (
+                            pe_to_multiplier_request_valid
+                        ) begin
+                            pe_state <=
+                                WAIT_PRODUCT_AND_PREVIOUS_SUM;
                         end
                     end
                 end
 
-                MUL_WAIT: begin
-                    // Ответ памяти и результат умножения
-                    // могут прийти на разных тактах.
-                    if (a_rsp_valid) begin
-                        old_sum <= a_rsp.value;
-                        sum_seen <= 1'b1;
+                WAIT_PRODUCT_AND_PREVIOUS_SUM: begin
+                    // Предыдущая сумма и произведение могут
+                    // поступить на разных тактах.
+                    if (local_mem_a_to_pe_response_valid) begin
+                        previous_sum_reg <=
+                            local_mem_a_to_pe_response.value;
+
+                        previous_sum_received_reg <= 1'b1;
                     end
 
-                    if (mul_out_valid) begin
-                        product <= mul_result;
-                        product_seen <= 1'b1;
+                    if (multiplier_to_pe_result_valid) begin
+                        weight_input_product_reg <=
+                            multiplier_to_pe_result;
+
+                        product_received_reg <= 1'b1;
                     end
 
-                    if (a_rsp_valid && a_rsp.error) begin
-                        status_reg <= PE_BAD_ADDR;
-                        state <= ERROR;
+                    if (
+                        local_mem_a_to_pe_response_valid &&
+                        local_mem_a_to_pe_response.error
+                    ) begin
+                        error_status_reg <= PE_BAD_ADDR;
+                        pe_state <= FAULT;
 
                     end else if (
                         (
-                            a_rsp_valid &&
-                            a_rsp.value[30:23] == 8'hFF
+                            local_mem_a_to_pe_response_valid &&
+                            local_mem_a_to_pe_response.value[30:23]
+                                == 8'hFF
                         ) ||
                         (
-                            mul_out_valid &&
-                            mul_result[30:23] == 8'hFF
+                            multiplier_to_pe_result_valid &&
+                            multiplier_to_pe_result[30:23]
+                                == 8'hFF
                         )
                     ) begin
-                        status_reg <= PE_BAD_FP;
-                        state <= ERROR;
+                        error_status_reg <= PE_BAD_FP;
+                        pe_state <= FAULT;
 
                     end else if (
-                        (sum_seen || a_rsp_valid) &&
-                        (product_seen || mul_out_valid)
+                        (
+                            previous_sum_received_reg ||
+                            local_mem_a_to_pe_response_valid
+                        ) &&
+                        (
+                            product_received_reg ||
+                            multiplier_to_pe_result_valid
+                        )
                     ) begin
-                        state <= ADD_REQ;
+                        pe_state <= ISSUE_ACCUMULATE;
                     end
                 end
 
-                ADD_REQ: begin
-                    state <= ADD_WAIT;
+                ISSUE_ACCUMULATE: begin
+                    pe_state <= WAIT_ACCUMULATE_RESULT;
                 end
 
-                ADD_WAIT: begin
-                    if (add_out_valid) begin
-                        if (add_result[30:23] == 8'hFF) begin
-                            status_reg <= PE_BAD_FP;
-                            state <= ERROR;
+                WAIT_ACCUMULATE_RESULT: begin
+                    if (adder_to_pe_result_valid) begin
+                        if (
+                            adder_to_pe_result[30:23] == 8'hFF
+                        ) begin
+                            error_status_reg <= PE_BAD_FP;
+                            pe_state <= FAULT;
 
                         end else begin
-                            new_sum <= add_result;
-                            state <= STORE;
+                            updated_sum_reg <= adder_to_pe_result;
+                            pe_state <= WRITE_UPDATED_SUM;
                         end
                     end
                 end
 
-                STORE: begin
-                    if (a_valid && a_ready)
-                        state <= STORE_WAIT;
+                WRITE_UPDATED_SUM: begin
+                    if (
+                        pe_to_local_mem_a_request_valid &&
+                        local_mem_a_to_pe_request_ready
+                    )
+                        pe_state <= WAIT_SUM_WRITE_RESPONSE;
                 end
 
-                STORE_WAIT: begin
-                    if (a_rsp_valid) begin
-                        if (a_rsp.error) begin
-                            status_reg <= PE_BAD_ADDR;
-                            state <= ERROR;
+                WAIT_SUM_WRITE_RESPONSE: begin
+                    if (local_mem_a_to_pe_response_valid) begin
+                        if (local_mem_a_to_pe_response.error) begin
+                            error_status_reg <= PE_BAD_ADDR;
+                            pe_state <= FAULT;
 
                         end else begin
-                            state <= agu_data.last
-                                ? OUT_READ
-                                : MAC_READ;
+                            pe_state <= agu_to_pe_addresses.last
+                                ? REQUEST_OUTPUT_SUM
+                                : REQUEST_WEIGHT_AND_INPUT;
                         end
                     end
                 end
 
-                OUT_READ: begin
-                    if (a_valid && a_ready)
-                        state <= OUT_WAIT;
+                REQUEST_OUTPUT_SUM: begin
+                    if (
+                        pe_to_local_mem_a_request_valid &&
+                        local_mem_a_to_pe_request_ready
+                    )
+                        pe_state <= WAIT_OUTPUT_SUM;
                 end
 
-                OUT_WAIT: begin
-                    if (a_rsp_valid) begin
-                        if (a_rsp.error) begin
-                            status_reg <= PE_BAD_ADDR;
-                            done_reg <= 1'b0;
-                            state <= ERROR;
+                WAIT_OUTPUT_SUM: begin
+                    if (local_mem_a_to_pe_response_valid) begin
+                        if (local_mem_a_to_pe_response.error) begin
+                            error_status_reg <= PE_BAD_ADDR;
+                            layer_done_reg <= 1'b0;
+                            pe_state <= FAULT;
 
                         end else if (
-                            a_rsp.value[30:23] == 8'hFF
+                            local_mem_a_to_pe_response.value[30:23]
+                                == 8'hFF
                         ) begin
-                            status_reg <= PE_BAD_FP;
-                            done_reg <= 1'b0;
-                            state <= ERROR;
+                            error_status_reg <= PE_BAD_FP;
+                            layer_done_reg <= 1'b0;
+                            pe_state <= FAULT;
 
                         end else begin
-                            output_value <= a_rsp.value;
+                            output_sum_reg <=
+                                local_mem_a_to_pe_response.value;
 
-                            done_reg <= 1'b1;
-                            state <= OUT_VALID;
+                            layer_done_reg <= 1'b1;
+                            pe_state <= HOLD_OUTPUT_SUM;
                         end
                     end
                 end
 
-                OUT_VALID: begin
-                    // До handshake данные остаются
-                    // в выходном регистре без изменений.
-                    if (
-                        pe_to_reduce_valid_o &&
-                        pe_to_reduce_ready_i
-                    ) begin
-                        state <= HOLD;
-                    end
-                end
-
-                ERROR: begin
-                    // Выход из ошибки - через rst_n_i.
-                    done_reg <= 1'b0;
+                FAULT: begin
+                    // Выход из ошибки - через reset.
+                    layer_done_reg <= 1'b0;
                 end
 
                 default: begin
-                    status_reg <= PE_BAD_CMD;
-                    done_reg <= 1'b0;
-                    state <= ERROR;
+                    error_status_reg <= PE_BAD_CMD;
+                    layer_done_reg <= 1'b0;
+                    pe_state <= FAULT;
                 end
 
             endcase

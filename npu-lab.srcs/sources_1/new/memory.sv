@@ -6,151 +6,182 @@ module memory #(
     input logic clk_i,
     input logic rst_n_i,
 
-    // Порт A: запрос.
-    input memory_types_pkg::mem_req_t a_req_data_i,
-    input  logic a_req_valid_i,
-    output logic a_req_ready_o,
+    // Порт A: клиент -> память, запрос.
+    input memory_types_pkg::mem_req_t
+        a_client_to_mem_request_data_i,
 
-    // Порт A: ответ.
-    output memory_types_pkg::mem_rsp_t a_rsp_data_o,
-    output logic a_rsp_valid_o,
-    input  logic a_rsp_ready_i,
+    input logic a_client_to_mem_request_valid_i,
+    output logic a_mem_to_client_request_ready_o,
 
-    // Порт B: запрос.
-    input memory_types_pkg::mem_req_t b_req_data_i,
-    input  logic b_req_valid_i,
-    output logic b_req_ready_o,
+    // Порт A: память -> клиент, ответ.
+    output memory_types_pkg::mem_rsp_t
+        a_mem_to_client_response_data_o,
 
-    // Порт B: ответ.
-    output memory_types_pkg::mem_rsp_t b_rsp_data_o,
-    output logic b_rsp_valid_o,
-    input  logic b_rsp_ready_i
+    output logic a_mem_to_client_response_valid_o,
+    input  logic a_client_to_mem_response_ready_i,
+
+    // Порт B: клиент -> память, запрос.
+    input memory_types_pkg::mem_req_t
+        b_client_to_mem_request_data_i,
+
+    input logic b_client_to_mem_request_valid_i,
+    output logic b_mem_to_client_request_ready_o,
+
+    // Порт B: память -> клиент, ответ.
+    output memory_types_pkg::mem_rsp_t
+        b_mem_to_client_response_data_o,
+
+    output logic b_mem_to_client_response_valid_o,
+    input  logic b_client_to_mem_response_ready_i
 );
 
-    localparam int ADDR_WIDTH =
+    localparam int WORD_INDEX_WIDTH =
         (MEM_WORDS > 1) ? $clog2(MEM_WORDS) : 1;
 
-    localparam logic [31:0] MEM_BYTES =
+    localparam logic [31:0] MEM_CAPACITY_BYTES =
         $unsigned(MEM_WORDS) << 2;
 
-    // Каждый экземпляр модуля содержит свой массив.
-    logic [31:0] storage [0:MEM_WORDS-1];
+    // Каждый экземпляр memory содержит собственный массив.
+    // Содержимое массива при reset не очищается.
+    logic [31:0] memory_words [0:MEM_WORDS-1];
 
-    logic [31:0] a_read_data;
-    logic [31:0] b_read_data;
+    // Данные последнего выполненного чтения.
+    logic [31:0] port_a_read_value_reg;
+    logic [31:0] port_b_read_value_reg;
 
-    logic a_error;
-    logic b_error;
+    // Ошибка адреса для текущего ответа.
+    logic port_a_error_reg;
+    logic port_b_error_reg;
 
-    logic a_accept;
-    logic b_accept;
+    // Запрос принят на текущем фронте.
+    logic port_a_request_accepted;
+    logic port_b_request_accepted;
 
-    logic a_addr_ok;
-    logic b_addr_ok;
+    // Адрес выровнен и находится в пределах памяти.
+    logic port_a_address_valid;
+    logic port_b_address_valid;
 
-    logic [ADDR_WIDTH-1:0] a_word_addr;
-    logic [ADDR_WIDTH-1:0] b_word_addr;
+    // Индексы слов, полученные из байтовых адресов.
+    logic [WORD_INDEX_WIDTH-1:0] port_a_word_index;
+    logic [WORD_INDEX_WIDTH-1:0] port_b_word_index;
 
-    // Байтовый адрес -> номер 32-битного слова.
-    assign a_word_addr =
-        ADDR_WIDTH'(a_req_data_i.addr >> 2);
+    assign port_a_word_index =
+        WORD_INDEX_WIDTH'(
+            a_client_to_mem_request_data_i.addr >> 2
+        );
 
-    assign b_word_addr =
-        ADDR_WIDTH'(b_req_data_i.addr >> 2);
+    assign port_b_word_index =
+        WORD_INDEX_WIDTH'(
+            b_client_to_mem_request_data_i.addr >> 2
+        );
 
-    // Проверка выравнивания и границ.
-    assign a_addr_ok =
-        a_req_data_i.addr[1:0] == 2'b00 &&
-        a_req_data_i.addr < MEM_BYTES;
+    assign port_a_address_valid =
+        a_client_to_mem_request_data_i.addr[1:0] == 2'b00 &&
+        a_client_to_mem_request_data_i.addr <
+            MEM_CAPACITY_BYTES;
 
-    assign b_addr_ok =
-        b_req_data_i.addr[1:0] == 2'b00 &&
-        b_req_data_i.addr < MEM_BYTES;
+    assign port_b_address_valid =
+        b_client_to_mem_request_data_i.addr[1:0] == 2'b00 &&
+        b_client_to_mem_request_data_i.addr <
+            MEM_CAPACITY_BYTES;
 
-    // Новый запрос разрешён, если:
-    // - предыдущего ответа нет;
-    // - либо предыдущий ответ принимается сейчас.
-    assign a_req_ready_o =
-        !a_rsp_valid_o || a_rsp_ready_i;
+    // Новый запрос разрешён, если предыдущего ответа нет
+    // либо клиент принимает предыдущий ответ сейчас.
+    assign a_mem_to_client_request_ready_o =
+        !a_mem_to_client_response_valid_o ||
+        a_client_to_mem_response_ready_i;
 
-    assign b_req_ready_o =
-        !b_rsp_valid_o || b_rsp_ready_i;
+    assign b_mem_to_client_request_ready_o =
+        !b_mem_to_client_response_valid_o ||
+        b_client_to_mem_response_ready_i;
 
-    assign a_accept =
+    assign port_a_request_accepted =
         rst_n_i &&
-        a_req_valid_i &&
-        a_req_ready_o;
+        a_client_to_mem_request_valid_i &&
+        a_mem_to_client_request_ready_o;
 
-    assign b_accept =
+    assign port_b_request_accepted =
         rst_n_i &&
-        b_req_valid_i &&
-        b_req_ready_o;
+        b_client_to_mem_request_valid_i &&
+        b_mem_to_client_request_ready_o;
 
-    assign a_rsp_data_o.value = a_read_data;
-    assign a_rsp_data_o.error = a_error;
+    assign a_mem_to_client_response_data_o.value =
+        port_a_read_value_reg;
 
-    assign b_rsp_data_o.value = b_read_data;
-    assign b_rsp_data_o.error = b_error;
+    assign a_mem_to_client_response_data_o.error =
+        port_a_error_reg;
 
-    // --------------------------------------------------------
-    // Порт A: синхронное чтение и запись.
-    // Содержимое памяти не сбрасывается.
-    // --------------------------------------------------------
+    assign b_mem_to_client_response_data_o.value =
+        port_b_read_value_reg;
 
+    assign b_mem_to_client_response_data_o.error =
+        port_b_error_reg;
+
+    // Порт A: синхронное чтение или запись.
     always @(posedge clk_i) begin
-        if (a_accept && a_addr_ok) begin
-            if (a_req_data_i.write) begin
-                storage[a_word_addr] <= a_req_data_i.value;
+        if (
+            port_a_request_accepted &&
+            port_a_address_valid
+        ) begin
+            if (a_client_to_mem_request_data_i.write) begin
+                memory_words[port_a_word_index] <=
+                    a_client_to_mem_request_data_i.value;
             end else begin
-                a_read_data <= storage[a_word_addr];
+                port_a_read_value_reg <=
+                    memory_words[port_a_word_index];
             end
         end
     end
 
-    // --------------------------------------------------------
-    // Порт B: синхронное чтение и запись.
-    // --------------------------------------------------------
-
+    // Порт B: синхронное чтение или запись.
     always @(posedge clk_i) begin
-        if (b_accept && b_addr_ok) begin
-            if (b_req_data_i.write) begin
-                storage[b_word_addr] <= b_req_data_i.value;
+        if (
+            port_b_request_accepted &&
+            port_b_address_valid
+        ) begin
+            if (b_client_to_mem_request_data_i.write) begin
+                memory_words[port_b_word_index] <=
+                    b_client_to_mem_request_data_i.value;
             end else begin
-                b_read_data <= storage[b_word_addr];
+                port_b_read_value_reg <=
+                    memory_words[port_b_word_index];
             end
         end
     end
 
-    // --------------------------------------------------------
-    // Признаки наличия ответов и ошибки.
-    // --------------------------------------------------------
-
+    // Формирование ответов и удержание их до принятия.
     always_ff @(posedge clk_i or negedge rst_n_i) begin
         if (!rst_n_i) begin
-            a_rsp_valid_o <= 1'b0;
-            b_rsp_valid_o <= 1'b0;
+            a_mem_to_client_response_valid_o <= 1'b0;
+            b_mem_to_client_response_valid_o <= 1'b0;
 
-            a_error <= 1'b0;
-            b_error <= 1'b0;
+            port_a_error_reg <= 1'b0;
+            port_b_error_reg <= 1'b0;
 
         end else begin
-            if (a_rsp_valid_o && a_rsp_ready_i)
-                a_rsp_valid_o <= 1'b0;
+            if (
+                a_mem_to_client_response_valid_o &&
+                a_client_to_mem_response_ready_i
+            )
+                a_mem_to_client_response_valid_o <= 1'b0;
 
-            if (b_rsp_valid_o && b_rsp_ready_i)
-                b_rsp_valid_o <= 1'b0;
+            if (
+                b_mem_to_client_response_valid_o &&
+                b_client_to_mem_response_ready_i
+            )
+                b_mem_to_client_response_valid_o <= 1'b0;
 
-            // Новое принятие имеет приоритет:
-            // старый ответ может уйти, а новый появиться
-            // на том же фронте.
-            if (a_accept) begin
-                a_rsp_valid_o <= 1'b1;
-                a_error <= !a_addr_ok;
+            // Новый запрос имеет приоритет:
+            // предыдущий ответ может быть принят,
+            // а новый сформирован на том же фронте.
+            if (port_a_request_accepted) begin
+                a_mem_to_client_response_valid_o <= 1'b1;
+                port_a_error_reg <= !port_a_address_valid;
             end
 
-            if (b_accept) begin
-                b_rsp_valid_o <= 1'b1;
-                b_error <= !b_addr_ok;
+            if (port_b_request_accepted) begin
+                b_mem_to_client_response_valid_o <= 1'b1;
+                port_b_error_reg <= !port_b_address_valid;
             end
         end
     end
