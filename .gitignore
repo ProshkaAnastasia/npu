@@ -1,0 +1,18 @@
+# Временные папки Vivado
+**/NA/
+.Xil/
+*.html
+*.xml
+*.os
+*.png
+*.jou
+*.log
+*.pb
+*.str
+
+# Папки сборки и симуляции
+*.runs/
+*.sim/
+*.ip_user_files/
+*.hw/
+*.cache/
