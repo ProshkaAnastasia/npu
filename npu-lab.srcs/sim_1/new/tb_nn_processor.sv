@@ -1,13 +1,15 @@
 `timescale 1ns/1ps
 
-module tb_nn_processor;
+module tb_nn_processor #(
+    parameter int N_PE = 6
+);
 
     import io_types_pkg::*;
 
-    localparam int CLK_FREQ_HZ = 100_000_000;
+    localparam int CLK_FREQ_HZ    = 100_000_000;
     localparam int UART_BAUD_RATE = 12_500_000;
 
-    localparam time CLK_PERIOD = 10ns;
+    localparam time CLK_PERIOD       = 10ns;
     localparam time RESPONSE_TIMEOUT = 5ms;
 
     localparam time UART_BIT_PERIOD =
@@ -15,33 +17,34 @@ module tb_nn_processor;
 
     localparam MODEL_FILE = "test_model.mem";
     localparam INPUT_FILE = "test_input.mem";
-    localparam EXPECTED_FILE = "test_expected_p6.mem";
 
-    logic clk = 0;
+    string expected_file;
+
+    logic clk = 1'b0;
     always #(CLK_PERIOD / 2) clk = ~clk;
 
-    logic rst_n = 0;
+    logic rst_n = 1'b0;
 
     // UART-линии относительно компьютера.
-    logic host_to_npu_uart = 1;
+    logic host_to_npu_uart = 1'b1;
     logic npu_to_host_uart;
 
     logic model_valid;
     logic sequencer_busy;
 
-    integer request_sequence = 0;
+    integer request_sequence   = 0;
     integer received_byte_count = 0;
-    integer checked_byte_count = 0;
+    integer checked_byte_count  = 0;
 
-    logic [7:0] request_payload_bytes [0:259];
+    logic [7:0] request_payload_bytes  [0:259];
     logic [7:0] received_response_bytes [0:2047];
 
-    logic [31:0] model_image_words [0:662];
-    logic [31:0] input_vector_words [0:48];
+    logic [31:0] model_image_words     [0:662];
+    logic [31:0] input_vector_words    [0:48];
     logic [31:0] expected_output_words [0:14];
 
     nn_processor_top #(
-        .N_PE(6),
+        .N_PE(N_PE),
         .CLK_FREQ_HZ(CLK_FREQ_HZ),
         .UART_BAUD_RATE(UART_BAUD_RATE)
     ) dut (
@@ -63,9 +66,11 @@ module tb_nn_processor;
 
         c = c0 ^ {24'd0, b};
 
-        for (int k = 0; k < 8; k++)
-            c = c[0] ? ((c >> 1) ^ 32'hEDB88320)
-                     :  (c >> 1);
+        for (int k = 0; k < 8; k++) begin
+            c = c[0]
+                ? ((c >> 1) ^ 32'hEDB88320)
+                :  (c >> 1);
+        end
 
         return c;
     endfunction
@@ -77,12 +82,13 @@ module tb_nn_processor;
 
         file_handle = $fopen(filename, "r");
 
-        if (file_handle == 0)
+        if (file_handle == 0) begin
             $fatal(
                 1,
                 "Cannot open %s in simulator working directory",
                 filename
             );
+        end
 
         $fclose(file_handle);
     endtask
@@ -93,7 +99,7 @@ module tb_nn_processor;
     );
         @(negedge clk);
 
-        host_to_npu_uart = 0;
+        host_to_npu_uart = 1'b0;
         #(UART_BIT_PERIOD);
 
         for (int i = 0; i < 8; i++) begin
@@ -101,7 +107,7 @@ module tb_nn_processor;
             #(UART_BIT_PERIOD);
         end
 
-        host_to_npu_uart = 1;
+        host_to_npu_uart = 1'b1;
         #(UART_BIT_PERIOD);
     endtask
 
@@ -115,7 +121,7 @@ module tb_nn_processor;
             @(negedge npu_to_host_uart);
             #(UART_BIT_PERIOD / 2);
 
-            if (npu_to_host_uart !== 0)
+            if (npu_to_host_uart !== 1'b0)
                 $fatal(1, "Bad start bit");
 
             for (int i = 0; i < 8; i++) begin
@@ -125,7 +131,7 @@ module tb_nn_processor;
 
             #(UART_BIT_PERIOD);
 
-            if (npu_to_host_uart !== 1)
+            if (npu_to_host_uart !== 1'b1)
                 $fatal(1, "Bad stop bit");
 
             if ((^b) === 1'bx)
@@ -141,12 +147,12 @@ module tb_nn_processor;
         end
     end
 
-    // cmd         - команда.
-    // arg         - размер, смещение или адрес.
-    // n           - количество передаваемых 32-битных слов.
-    // index       - начальный индекс исходного массива.
-    // use_input   - брать слова из входного вектора.
-    // bad_crc     - намеренно испортить CRC запроса.
+    // cmd       - команда.
+    // arg       - размер, смещение или адрес.
+    // n         - число передаваемых 32-битных слов.
+    // index     - начальный индекс исходного массива.
+    // use_input - брать слова из входного вектора.
+    // bad_crc   - намеренно испортить CRC запроса.
     // repeat_previous_request - сохранить предыдущий SEQ.
     task automatic send_request_and_check_response(
         input logic [7:0] cmd,
@@ -171,17 +177,18 @@ module tb_nn_processor;
 
         time response_deadline;
 
-        if (!repeat_previous_request)
+        if (!repeat_previous_request) begin
             request_sequence =
                 (request_sequence + 1) & 16'hFFFF;
+        end
 
         len = 0;
 
         if (
             cmd == CMD_CONFIG_BEGIN ||
-            cmd == CMD_INPUT_BEGIN ||
-            cmd == CMD_READ_WORD ||
-            cmd == CMD_CONFIG_DATA ||
+            cmd == CMD_INPUT_BEGIN  ||
+            cmd == CMD_READ_WORD    ||
+            cmd == CMD_CONFIG_DATA  ||
             cmd == CMD_INPUT_DATA
         ) begin
             for (int b = 0; b < 4; b++)
@@ -190,11 +197,12 @@ module tb_nn_processor;
             len = 4;
         end
 
-        if (n < 0 || n > 64 || index < 0)
+        if (n < 0 || n > 64 || index < 0) begin
             $fatal(
                 1,
                 "Invalid packet word count or source index"
             );
+        end
 
         if (
             n > 0 &&
@@ -202,8 +210,9 @@ module tb_nn_processor;
                 (use_input && index+n > 49) ||
                 (!use_input && index+n > 663)
             )
-        )
+        ) begin
             $fatal(1, "Packet source array is out of bounds");
+        end
 
         if (len + 4*n > 260)
             $fatal(1, "Packet payload is too large");
@@ -213,9 +222,10 @@ module tb_nn_processor;
                 ? input_vector_words[index+i]
                 : model_image_words[index+i];
 
-            for (int b = 0; b < 4; b++)
+            for (int b = 0; b < 4; b++) begin
                 request_payload_bytes[len + 4*i + b] =
                     w[8*b +: 8];
+            end
         end
 
         len = len + 4*n;
@@ -248,7 +258,7 @@ module tb_nn_processor;
         c = c ^ 32'hFFFFFFFF;
 
         if (bad_crc)
-            c = c ^ 1;
+            c = c ^ 32'd1;
 
         for (int b = 0; b < 4; b++)
             send_uart_byte(c[8*b +: 8]);
@@ -260,10 +270,11 @@ module tb_nn_processor;
         while (
             received_byte_count < base + 17 &&
             $time < response_deadline
-        )
+        ) begin
             @(negedge clk);
+        end
 
-        if (received_byte_count < base + 17)
+        if (received_byte_count < base + 17) begin
             $fatal(
                 1,
                 "Response timeout CMD=%h SEQ=%0d received=%0d expected=%0d",
@@ -272,6 +283,7 @@ module tb_nn_processor;
                 received_byte_count,
                 base + 17
             );
+        end
 
         if (
             received_response_bytes[base] !== 8'hA5 ||
@@ -282,7 +294,7 @@ module tb_nn_processor;
             {
                 received_response_bytes[base+6],
                 received_response_bytes[base+5]
-            } !== 6 ||
+            } !== 16'd6 ||
 
             received_response_bytes[base+8] !== expected_status ||
 
@@ -295,7 +307,8 @@ module tb_nn_processor;
         ) begin
             $fatal(
                 1,
-                "UART response mismatch cmd=%h status=%h expected=%h value=%h expected=%h",
+                "UART response mismatch N_PE=%0d cmd=%h status=%h expected=%h value=%h expected=%h",
+                N_PE,
                 cmd,
                 received_response_bytes[base+8],
                 expected_status,
@@ -316,10 +329,10 @@ module tb_nn_processor;
                     received_response_bytes[base+3]
                 } !== 16'hFFFF ||
 
-                received_response_bytes[base+7] !== 0
-            )
+                received_response_bytes[base+7] !== 8'd0
+            ) begin
                 $fatal(1, "Bad transport-error header");
-
+            end
         end else if (
             {
                 received_response_bytes[base+4],
@@ -344,8 +357,9 @@ module tb_nn_processor;
                 received_response_bytes[base+14],
                 received_response_bytes[base+13]
             } !== (c ^ 32'hFFFFFFFF)
-        )
+        ) begin
             $fatal(1, "Bad response CRC");
+        end
 
         checked_byte_count = base + 17;
 
@@ -353,50 +367,71 @@ module tb_nn_processor;
     endtask
 
     initial begin
+        if (N_PE < 1)
+            $fatal(1, "N_PE must be greater than zero");
+
+        expected_file = $sformatf(
+            "test_expected_p%0d.mem",
+            N_PE
+        );
+
+        $display(
+            "Starting physical UART test: N_PE=%0d, reference=%s",
+            N_PE,
+            expected_file
+        );
+
         require_file(MODEL_FILE);
         require_file(INPUT_FILE);
-        require_file(EXPECTED_FILE);
+        require_file(expected_file);
         require_file("sigmoid_lut.mem");
 
         $readmemh(MODEL_FILE, model_image_words);
         $readmemh(INPUT_FILE, input_vector_words);
-        $readmemh(EXPECTED_FILE, expected_output_words);
+        $readmemh(expected_file, expected_output_words);
 
-        for (int i = 0; i < 663; i++)
-            if ((^model_image_words[i]) === 1'bx)
+        for (int i = 0; i < 663; i++) begin
+            if ((^model_image_words[i]) === 1'bx) begin
                 $fatal(
                     1,
                     "Model word %0d is missing or contains X/Z",
                     i
                 );
+            end
+        end
 
-        for (int i = 0; i < 49; i++)
-            if ((^input_vector_words[i]) === 1'bx)
+        for (int i = 0; i < 49; i++) begin
+            if ((^input_vector_words[i]) === 1'bx) begin
                 $fatal(
                     1,
                     "Input word %0d is missing or contains X/Z",
                     i
                 );
+            end
+        end
 
-        for (int i = 0; i < 15; i++)
-            if ((^expected_output_words[i]) === 1'bx)
+        for (int i = 0; i < 15; i++) begin
+            if ((^expected_output_words[i]) === 1'bx) begin
                 $fatal(
                     1,
                     "Expected word %0d is missing or contains X/Z",
                     i
                 );
+            end
+        end
 
         if (
             model_image_words[0] !== 32'h32504E4E ||
             model_image_words[5] !== 32'd2652
-        )
+        ) begin
             $fatal(
                 1,
                 "This test requires the 2652-byte NNP2 example model"
             );
+        end
 
         repeat (5) @(negedge clk);
-        rst_n = 1;
+        rst_n = 1'b1;
 
         send_request_and_check_response(
             CMD_CONFIG_BEGIN,
@@ -543,8 +578,9 @@ module tb_nn_processor;
         );
 
         $display(
-            "ALL PHYSICAL UART -> SEQUENCER -> PE -> RS -> MEMORY TESTS PASSED: %0d packets",
-            checked_byte_count / 17
+            "ALL PHYSICAL UART -> SEQUENCER -> PE -> RS -> MEMORY TESTS PASSED: %0d packets, N_PE=%0d",
+            checked_byte_count / 17,
+            N_PE
         );
 
         $finish;
